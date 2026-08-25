@@ -49,7 +49,8 @@ return function(require, _unused, Lib)
     -- │  El OP = índice `count` de la tabla de remotes del cliente (re-decompilado del BClient).
     -- │  BUMP DE VERSIÓN DEL JUEGO = re-decompilar BClient y actualizar SOLO esta tabla.
     -- │  Historial: v48→v50 la lista de remotes creció → grab +2, todo lo demás +3 desde shoot.
-    -- └─ (2026-08-19, verificado contra BClientv50 PlaceVersion=50)
+    -- │  v50→v51: tabla netevgen IDÉNTICA (0 remotes agregados/reordenados) → TODOS los opcodes intactos.
+    -- └─ (2026-08-25, RE-VERIFICADO línea-por-línea contra BClientV51.txt reg. 14831-14977, PlaceVersion=51)
     LIP.OP = {
         TEAM    = 1,    -- JoinTeam(TeamInstance)                              [v48 1]
         GRAB    = 14,   -- ReceiveTool(toolModel)                             [v48 12]
@@ -65,6 +66,14 @@ return function(require, _unused, Lib)
         BUFF    = 50,   -- CharacterDeOrBuff(Model, effect, amount, ...)     [v48 47]
         TURRET  = 59,   -- Turret(turret, phase, hits/aim, GST)              [v48 56]
         CUFFS   = 60,   -- Handcuffs(cuffs, targetPlayer)                     [v48 57]
+        -- AC (cliente→server): el cliente REPORTA detecciones. Los disablers dropean estos.
+        ACTRIGGER = 69, -- ACTrigger(codeName, extra)  (ej. "UnequipToolsHook")  [SALIENTE]
+        ACCFRAME  = 70, -- ACCFrameChanged                                        [SALIENTE]
+        ACKICK    = 71, -- ACKickTrigger(codeName, extra)  → escala a kick        [SALIENTE]
+        ACF       = 72, -- ACF: SOLO ENTRANTE (server→cliente OnClientEvent, magic 4274471892 → corre un
+                        -- manager de ragdoll benigno). El cliente NUNCA hace ACF:FireServer → dropear op72
+                        -- saliente en disableACReports es no-op inofensivo (no rompe ningún heartbeat).
+        -- v51 OK: 69-72 verificados contra BClientV51.txt (14971-14977).
     }
     -- signals del combat-vfx-port: onShot(origin, hitPos, isLocal) desde Combat/Weapon.lua,
     -- onHit(player, part, damage, lethal) desde Visuals/HitEffects.lua. Se crean SIEMPRE frescos
@@ -123,6 +132,20 @@ return function(require, LIP, Lib)
     local hookmm  = hookmetamethod
     local unpackf = table.unpack or unpack
     local ZERO    = Vector3.zero
+    local LP      = game:GetService("Players").LocalPlayer
+
+    -- DISABLERS (experimentales): señal MUERTA p/ neutralizar GetPropertyChangedSignal del AC + set de props.
+    local DEAD_CONN   = { Disconnect = function() end, disconnect = function() end, Connected = false }
+    local DEAD_SIGNAL = {
+        Connect         = function() return DEAD_CONN end,
+        connect         = function() return DEAD_CONN end,
+        Once            = function() return DEAD_CONN end,
+        ConnectParallel = function() return DEAD_CONN end,
+        Wait            = function() while true do task.wait(1e8) end end,   -- nunca retorna (el AC casi nunca lo usa)
+    }
+    local MOVE_PROPS = { CanCollide=true, Position=true, CFrame=true, Velocity=true, AssemblyLinearVelocity=true,
+        AssemblyAngularVelocity=true, WalkSpeed=true, JumpPower=true, JumpHeight=true, PlatformStand=true,
+        CollisionGroup=true, CollisionGroupId=true, Anchored=true }
 
     function Net.install()
         LIP.RE = LIP.RE or (LIP.Events and LIP.Events:FindFirstChild("RemoteEvent"))
@@ -132,9 +155,27 @@ return function(require, LIP, Lib)
         -- melee/turret). Devuelve: (true, <resultado de orig>) si MANEJÓ el call (swap); false = passthrough.
         function LIP._onNamecall(self, orig, ...)
             local D = getgenv().LIP
-            if not (D and self == D.RE and getncm() == "FireServer") then return false end
+            if not D then return false end
+            local method = getncm()
+            -- DISABLER movimiento: GetPropertyChangedSignal en las partes del char p/ props de movimiento →
+            -- señal MUERTA (Connect nunca fira) → el AC no puede vigilar CanCollide/Position/CFrame/velocity.
+            if D.disableMoveChecks and method == "GetPropertyChangedSignal" then
+                local ch = LP.Character
+                if ch and typeof(self) == "Instance" and (self == ch or self.Parent == ch) then
+                    if MOVE_PROPS[(...)] then return true, DEAD_SIGNAL end
+                end
+            end
+            if not (self == D.RE and method == "FireServer") then return false end
             local p = table.pack(...)
             local op = p[1]
+            -- DISABLER reportes AC: dropear ACTrigger/ACCFrameChanged/ACKickTrigger/ACF (cliente→server) → el
+            -- server no recibe la detección (no llamamos orig). ⚠ opcodes v50 (verificar en v51).
+            if D.disableACReports and (op == D.OP.ACTRIGGER or op == D.OP.ACKICK or op == D.OP.ACCFRAME or op == D.OP.ACF) then
+                return true
+            end
+            if D.disableUnequipHook and op == D.OP.ACTRIGGER and p[2] == "UnequipToolsHook" then
+                return true
+            end
 
             -- ── OBSERVE (sin return; siempre corre) ──
             if op == D.OP.SHOOT then
@@ -186,14 +227,26 @@ return function(require, LIP, Lib)
                 local bullets = p[3]
                 local mult = D.bulletMult or 1
                 local swap = D.swapOn and D.cachedHitPart and D.cachedHitPos
-                if type(bullets) == "table" and (swap or mult > 1) then
+                -- FORCE SPOOF ORIGIN (toggle, opt-in): con pos-spoof/weld activo, el origen[1]+muzzle[2] de CADA
+                -- bala = spoofFakePos (donde el server te ve) → el tracer replica desde el cuerpo VISIBLE
+                -- spoofeado, NO desde el real (fix reveal + consistencia origin↔hit). Cubre auto (buildBullet ya
+                -- pone origen fake pero muzzle real) Y manual (el juego pone ambos reales). Wallbang tiene prioridad.
+                local fso = D.forceSpoofOrigin and (D.spoofOn or D.connRep) and D.spoofFakePos
+                local fakeO = fso and (D.spoofFakePos + Vector3.new(0, D.spoofOriginHeight or 1.5, 0)) or nil
+                if type(bullets) == "table" and (swap or mult > 1 or fso) then
                     if swap then
                         for i = 1, #bullets do
                             local b = bullets[i]
                             if type(b) == "table" then
                                 b[3] = D.cachedHitPos; b[4] = D.cachedHitPart; b[5] = D.cachedHitPos; b[6] = ZERO
-                                if D.wallbang and D.cachedOrigin then b[1] = D.cachedOrigin; b[2] = D.cachedOrigin end
+                                if D.wallbang and D.cachedOrigin then b[1] = D.cachedOrigin; b[2] = D.cachedOrigin
+                                elseif fso then b[1] = fakeO; b[2] = fakeO end
                             end
+                        end
+                    elseif fso then                                  -- manual/sin-target: solo redirige el origen
+                        for i = 1, #bullets do
+                            local b = bullets[i]
+                            if type(b) == "table" then b[1] = fakeO; b[2] = fakeO end
                         end
                     end
                     local base = #bullets
@@ -1859,22 +1912,25 @@ return function(require, LIP, Lib)
     --     server rechaza = unequip. Por eso el trigger (tickAuto) usa el contador UNIFICADO (Net: usuario+cheat).
     -- El R-key NO sirve: el autofire firea op17 directo, el 'ammo' cliente del juego queda lleno → R es no-op
     -- → munición server no se rellena → blanks (op17 sin munición) → kick. Este path la rellena de verdad.
+    -- RELOAD = el reload REAL del juego vía tecla R (VIM). NO más remotes sintéticos (MagDrop/OnReload a mano
+    -- = timing no matchea la anim → flag AC v50, sobre todo escopeta per-slug). Como el autofire ahora DRIVEA
+    -- el fire del JUEGO (VIM mouse1), la munición cliente del juego SE DECREMENTA de verdad → cuando está baja,
+    -- R dispara el reload REAL (anim + MagDrop→OnReload en los tiempos exactos del juego) = AC-safe por
+    -- definición. (Antes R era no-op porque el op17 directo dejaba el cargador cliente lleno.)
     function Weapon.reload()
         if LIP.reloading then return end
         local tool = firearm(); if not tool then return end
-        local mag = magSize()
-        local rt  = reloadTime()
         LIP.reloading = true
-        LIP._selfReload = true                 -- Net NO aprende reload-time de NUESTRO reload (queremos el del juego)
         LIP._lastReloadReal = os.clock()
         task.spawn(function()
-            pcall(function() LIP.fire(LIP.OP.MAGDROP, tool) end)
-            task.wait(rt)
-            local t2 = firearm() or tool
-            pcall(function() LIP.fire(LIP.OP.RELOAD, t2, mag, GST()) end)
+            local VIM = game:GetService("VirtualInputManager")
+            pcall(function()
+                VIM:SendKeyEvent(true,  Enum.KeyCode.R, false, game)
+                task.wait(0.03)
+                VIM:SendKeyEvent(false, Enum.KeyCode.R, false, game)
+            end)
+            task.wait((reloadTime() or 2.0) + 0.3)   -- esperar la anim real del juego
             LIP.serverShots = 0; LIP.shotsFired = 0
-            LIP._selfReload = false
-            task.wait(0.12)                    -- que el op43 registre server-side antes de reanudar el fuego
             LIP.reloading = false
         end)
     end
@@ -1984,46 +2040,37 @@ return function(require, LIP, Lib)
     -- nuestro stream sobre el disparo del juego en mouse1 = 2× rate = ban. Mientras sostenés M1 pausamos
     -- (el juego dispara + el silent-aim hook redirige al target). El DPS extra AC-safe = BULLET MULTIPLIER
     -- (N balas en 1 disparo legal). Auto-reload con timing real al agotar el cargador.
+    local function mb1(down) local VIM = game:GetService("VirtualInputManager")
+        pcall(function() VIM:SendMouseButtonEvent(0, 0, 0, down, game, 0) end) end
+    local function releaseMB() if LIP._mb1Held then mb1(false); LIP._mb1Held = false end end
+    LIP.onCleanup(releaseMB)
+
     function Weapon.tickAuto()
         local autoOn = T("AutoFire") and T("TargetStrafe")   -- autofire SOLO con target strafe
-        if not autoOn then return end
+        if not autoOn then releaseMB(); return end
         local now = os.clock()
-        -- PAUSA MIENTRAS DISPARÁS MANUAL (mouse1): el juego ya firea a su firerate → apilar = exceder = ban.
-        -- Actualizamos _lastAutoFire para no doble-firar apenas soltás M1 (mantiene el espaciado).
-        if UIS:IsMouseButtonPressed(Enum.UserInputType.MouseButton1) then LIP._lastAutoFire = now; return end
-        if LIP.reloading or LIP.attackHold or LIP.awGrabbing then LIP._lastAutoFire = now; return end
-        -- AUTO-RELOAD (ANTES de la pausa-void → también recarga en void-spam = "Reloading In Void"; el
-        -- force-void de voidStep la esconde mientras LIP.reloading). serverShots = contador unificado (Net,
-        -- usuario+cheat) = munición real. Recarga con 1 bala de margen: antes de blanks (op17 con ammo 0 =
-        -- kick AC v50) y solo con el cargador realmente gastado (recargar lleno = unequip).
-        if T("AutoReload") ~= false and (LIP.serverShots or 0) >= magSize() - 1 then
-            Weapon.reload(); return
-        end
-        -- VOID SPAM: solo disparar OUT del void; BAIT: origin en void → no registra
-        if LIP.voidSpamOn and LIP.voidShootOut and not LIP.voidShootOk then return end
-        if LIP.strafePhase == "bait" then return end
-        -- necesita target válido cacheado (si no, buildBullet raycastea cámara = balas al vacío)
-        if not LIP.cachedHitPart then return end
-        -- RANGO: no firar fuera de rango. ref = pos que ve el server (spoof primero; wallbang solo sin spoof).
-        -- didDefensive (resolver confiado) BYPASSA el gate.
+        -- PAUSAS (soltar MB1 en cada una → no dejar el juego firando solo):
+        if UIS:IsMouseButtonPressed(Enum.UserInputType.MouseButton1) then releaseMB(); return end  -- disparás manual
+        if LIP.reloading or LIP.attackHold or LIP.awGrabbing then releaseMB(); return end
+        if LIP.voidSpamOn and LIP.voidShootOut and not LIP.voidShootOk then releaseMB(); return end -- void IN
+        if LIP.strafePhase == "bait" then releaseMB(); return end
+        if not LIP.cachedHitPart then releaseMB(); return end     -- sin target resuelto
+        -- RANGO (ref = pos que ve el server). didDefensive bypassa.
         if LIP.cachedHitPos and not LIP.didDefensive then
             local h = char() and char():FindFirstChild("Head")
             local ref = ((LIP.spoofOn or LIP.connRep) and LIP.spoofFakePos)
                         or (LIP.wallbang and LIP.cachedOrigin) or (h and h.Position)
-            if ref and (LIP.cachedHitPos - ref).Magnitude > (O("FireRange") or 200) then return end
+            if ref and (LIP.cachedHitPos - ref).Magnitude > (O("FireRange") or 200) then releaseMB(); return end
         end
-        -- INTERVALO base = firerate REAL del arma (DB). Sin calibrar = 0.5s (2/s) ultra seguro.
-        local fr = weaponFirerate()
-        local baseInt = fr or 0.5
-        -- AutoFireRate = tope de rate (piso de intervalo): SOLO puede hacerlo MÁS LENTO, nunca más rápido que fr.
-        local maxRate = O("AutoFireRate") or 30
-        if maxRate and maxRate > 0 then baseInt = math.max(baseInt, 1 / maxRate) end
-        -- CONFIDENCE GATE (solo Resolver on): m<1 ALARGA el intervalo (dispara más lento, nunca más rápido).
+        -- AUTO-RELOAD: munición REAL del juego (gameAmmo N) en 0 → R = reload REAL (sin remotes sintéticos =
+        -- sin flag AC). Está sincronizada porque el JUEGO firea (VIM) y decrementa su propia munición.
+        local cur = select(1, gameAmmo())
+        if T("AutoReload") ~= false and cur and cur <= 0 then releaseMB(); Weapon.reload(); return end
+        -- CONFIDENCE GATE (Resolver on): m<1 → pulsamos MÁS LENTO (menos disparos cuando incierto).
         local m = 1
         if T("Resolver") and LIP.target then
             Strafe = Strafe or require("Combat.Strafe")
-            if LIP.targetExposed then
-                m = 1; LIP.fireMult = 1                       -- fire oportunista: target real/visible
+            if LIP.targetExposed then m = 1; LIP.fireMult = 1
             else
                 local conf  = Strafe.fireConfidence(LIP.target)
                 local floor = (O("RRAccuracy") or 0.5) * (1 - Strafe.CONF.hcRelax * Strafe.hitAccuracy(LIP.target))
@@ -2034,18 +2081,22 @@ return function(require, LIP, Lib)
                 if LIP.lastGoodHitPos and (now - lgt) < Strafe.CONF.backtrackWindow then
                     btM = math.clamp(1 - (now - lgt) / Strafe.CONF.backtrackWindow, 0, 1)
                 end
-                m = math.max(gateM, btM)
-                LIP.fireMult = m
-                if m < 0.02 then return end
+                m = math.max(gateM, btM); LIP.fireMult = m
+                if m < 0.02 then releaseMB(); return end
             end
-        else
-            LIP.fireMult = 1
-        end
-        local interval = baseInt / math.max(m, 0.02)          -- m<1 → intervalo más largo (más lento)
-        -- 1 DISPARO/FRAME MÁX, gateado por tiempo real (espejo del juego; sin accumulator = sin burst en lag).
-        if now - (LIP._lastAutoFire or 0) >= interval then
+        else LIP.fireMult = 1 end
+        -- PULSO MB1 al firerate. El JUEGO se auto-gatea por su propio firerate (`firerate <= now-v29`) →
+        -- IMPOSIBLE over-rate = AC-safe por diseño. margin/jitter = extra safe + cadencia no-perfecta. Pulso
+        -- corto (down→up ~2 frames) = 1 disparo (auto Y semi). El juego firea op17 → el hook lo redirige al
+        -- target (silent aim) + padea a N balas (multiplier). Fire rate efectivo = el legal del juego.
+        local fr = weaponFirerate() or 0.3
+        local margin = O("FireMargin"); margin = (margin and margin > 0.05) and margin or 0.914
+        local jitter = O("FireJitter") or 0.05
+        local iv = (fr / margin) / math.max(m, 0.02) * (1 + (math.random() * 2 - 1) * jitter)
+        if now - (LIP._lastAutoFire or 0) >= iv then
             LIP._lastAutoFire = now
-            fireOne(LIP.cachedHitPart, LIP.cachedHitPos, nextGST())   -- 1 bala; el hook la multiplica a N
+            mb1(true); LIP._mb1Held = true
+            task.delay(0.035, function() mb1(false); LIP._mb1Held = false end)
         end
     end
 
@@ -2158,7 +2209,8 @@ return function(require, LIP, Lib)
         local root = hrp(); if not root then return end
         stopFly()
         flying = true
-        local h = hum(); if h then h.PlatformStand = true end
+        -- PlatformStand REMOVIDO (posible flag AC de movimiento): fly puro por velocidad + BodyGyro. El
+        -- Humanoid puede jugar anim de caída pero la velocidad la overridea cada frame.
         flyBG = Instance.new("BodyGyro")
         flyBG.MaxTorque = Vector3.new(1, 1, 1) * 9e9
         flyBG.P = 1e4
@@ -2187,11 +2239,27 @@ return function(require, LIP, Lib)
         root.AssemblyAngularVelocity = Vector3.zero
     end
 
-    ------------------------------------------------------------------ NOCLIP
-    local function updateNoclip()
+    ------------------------------------------------------------------ NOCLIP (método "part": CollisionGroup)
+    -- En vez de tocar CanCollide del char (el AC puede vigilar GetPropertyChangedSignal("CanCollide")), movemos
+    -- las partes del char a un CollisionGroup propio que NO colisiona con Default (el mapa) → phasea SIN disparar
+    -- el changed-signal de CanCollide. El CanCollide del char queda TRUE (pasa el check del AC). Restaura a
+    -- Default al apagar.
+    local PhysicsService = game:GetService("PhysicsService")
+    local NC_GROUP, ncReady = "LIP_NC", false
+    local function ensureNCGroup()
+        if ncReady then return end
+        ncReady = true
+        pcall(function() PhysicsService:RegisterCollisionGroup(NC_GROUP) end)
+        pcall(function() PhysicsService:CollisionGroupSetCollidable(NC_GROUP, "Default", false) end)
+    end
+    local function updateNoclip(on)
         local c = char(); if not c then return end
+        ensureNCGroup()
+        local target = on and NC_GROUP or "Default"
         for _, p in ipairs(c:GetDescendants()) do
-            if p:IsA("BasePart") and p.CanCollide then p.CanCollide = false end
+            if p:IsA("BasePart") and p.CollisionGroup ~= target then
+                pcall(function() p.CollisionGroup = target end)
+            end
         end
     end
 
@@ -2228,7 +2296,7 @@ return function(require, LIP, Lib)
             elseif flying then
                 stopFly()
             end
-            if T("Noclip") then updateNoclip() end
+            updateNoclip(T("Noclip") == true)   -- on/off: setea/restaura el CollisionGroup
         end))
 
         LIP.track(RunService.Heartbeat:Connect(function()
@@ -2721,12 +2789,10 @@ return function(require, LIP, Lib)
     local function rndSigned() return rnd() * 2 - 1 end
 
     -- patrones de void (TODOS altos — clamp Y≥30 para NUNCA tocar el vacío, que mata).
-    -- Rotación XYZ random SIEMPRE. Origen absoluto (0,100,0).
-    -- estado de los patrones. `anchor` = base (ORIGIN absoluto para void/idle; pos real para CFrame Desync).
-    -- `dist` = RADIUS (1-100 close) para Random/Teleport/Jitter/StaticBreak; Nebula usa FarDist/MapRadius.
-    local tpAnchor, tpT = nil, 0
-    local jitP1, jitP2, jitReseed, jitFlip = nil, nil, 0, false
-    local sbAnchor, sbT = nil, 0
+    -- Rotación XYZ random SIEMPRE. Origen absoluto (0,100,0). SOLO 2 patrones (pedido usuario):
+    --   Random = scatter 3D a distancias VARIADAS (near↔far, sesgo far) cada frame → delta irresolvible.
+    --   Nebula = FAR (∞, un-hittable por latencia) ↔ MAP (spot sostenido) → deltas ridículos.
+    -- `anchor` = base (ORIGIN absoluto para void; pos real para CFrame Desync). `dist` = RADIUS base (slider).
     local nebT, nebPhase, nebSpot, nebFar, nebStatic = 0, "far", nil, nil, true
     local function patternCF(anchor, dist, pattern)
         anchor = anchor or ORIGIN
@@ -2741,30 +2807,7 @@ return function(require, LIP, Lib)
         local rot = CFrame.Angles(rnd() * 6.2831, rnd() * 6.2831, rnd() * 6.2831)   -- anti-aim rotacional XYZ
         local now = os.clock()
         local off
-        if pattern == "Teleport" then
-            -- NON-PATTERN: mantiene un offset random ~0.3s y salta (discreto)
-            if not tpAnchor or (now - tpT) > 0.3 then
-                tpAnchor = Vector3.new(rndSigned() * dist, rnd() * dist * 0.5, rndSigned() * dist); tpT = now
-            end
-            off = tpAnchor
-        elseif pattern == "Jitter" then
-            -- PATTERN anti-centroide: 2 puntos fijos OPUESTOS en XZ, snap entre ellos cada frame → el promedio
-            -- (centroide) cae en el punto medio = ORIGIN = aire. Re-seedea los 2 puntos cada ~0.6s (menos predecible).
-            if not jitP1 or (now - jitReseed) > 0.6 then
-                local a = Vector3.new(rndSigned() * dist, rnd() * dist * 0.5, rndSigned() * dist)
-                jitP1 = a; jitP2 = Vector3.new(-a.X, a.Y, -a.Z); jitReseed = now
-            end
-            jitFlip = not jitFlip
-            off = jitFlip and jitP1 or jitP2
-        elseif pattern == "StaticBreak" then
-            -- PATTERN peek-then-flick: QUIETO en un offset fijo ~0.5s (baitea al resolver a lockear) + FLICK al
-            -- opuesto ~0.1s (el "break") → el enemigo lockea el punto estático y al break ya no estás ahí.
-            if not sbAnchor or (now - sbT) > 0.6 then
-                sbAnchor = Vector3.new(rndSigned() * dist, rnd() * dist * 0.5, rndSigned() * dist); sbT = now
-            end
-            if (now - sbT) > 0.5 then off = Vector3.new(-sbAnchor.X, sbAnchor.Y, -sbAnchor.Z)   -- BREAK (flick opuesto)
-            else off = sbAnchor end                                                              -- STATIC (bait)
-        elseif pattern == "Nebula" then
+        if pattern == "Nebula" then
             -- FAR↔MAP a distancias RIDÍCULAS: FAR (~0.15s) = dir random 3D * FarDist (300M, un-hittable por
             -- latencia); MAP (~0.3s) = spot random cerca del anchor dentro de MapRadius, SOSTENIDO 0.3s. Cada
             -- spot es STATIC (rompe predicts: te lockean quieto y saltás) o con jitter chico (rompe centroide).
@@ -2780,14 +2823,21 @@ return function(require, LIP, Lib)
                     nebPhase = "far"; nebT = now + 0.15
                     local dx, dy, dz = rndSigned(), rndSigned(), rndSigned()
                     local m = math.sqrt(dx*dx + dy*dy + dz*dz); if m < 1e-6 then m = 1 end
-                    nebFar = Vector3.new(dx/m, math.abs(dy/m), dz/m) * FarD   -- Y+ (nunca al vacío)
+                    -- FarDist con jitter ±40% por eje → cada far es una dirección Y magnitud distinta (irresolvible)
+                    nebFar = Vector3.new(dx/m, math.abs(dy/m), dz/m) * (FarD * (0.6 + rnd() * 0.8))
                 end
             end
             if nebPhase == "far" then off = nebFar or Vector3.new(FarD, FarD, 0)
             elseif nebStatic then off = nebSpot or Vector3.zero                            -- ESTÁTICO (rompe predicts)
             else off = (nebSpot or Vector3.zero) + Vector3.new(rndSigned() * 5, 0, rndSigned() * 5) end  -- jitter (rompe centroide)
-        else -- "Random" (NON-PATTERN, default): offset XYZ random cada frame dentro del radius
-            off = Vector3.new(rndSigned() * dist, rnd() * dist * 0.5, rndSigned() * dist)
+        else -- "Random" (default): scatter 3D en distancias VARIADAS (near↔far) cada frame → irresolvible.
+            -- dir 3D uniforme en el hemisferio superior (dy≥0 → NUNCA al vacío) * dist escalado por factor
+            -- random 1x..~61x sesgado a chico (rnd*rnd) con far ocasional → posiciones MUCHO más lejanas que
+            -- el box viejo, sin patrón resoluble (cada frame otra dir + otra magnitud).
+            local dx, dy, dz = rndSigned(), rnd(), rndSigned()
+            local m = math.sqrt(dx*dx + dy*dy + dz*dz); if m < 1e-6 then m = 1 end
+            local scale = dist * (1 + rnd() * rnd() * 60)
+            off = Vector3.new(dx/m, dy/m, dz/m) * scale
         end
         local pos = anchor + off
         if not antiDelta and pos.Y < 30 then pos = Vector3.new(pos.X, 30 + math.abs(pos.Y), pos.Z) end   -- NUNCA al vacío (salvo anti-delta, que VA al kill plane)
@@ -2798,11 +2848,10 @@ return function(require, LIP, Lib)
     -- PRESETS PRO (VoidPreset): pattern + radius + timing in/out. Non-pattern (Legit/Chaos/Blink) vs pattern
     -- anti-centroide (Jitter/Peek). applyPreset setea las Options (mismo mecanismo que Strafe.applyPreset).
     Void.PRESETS = {
-        Legit  = { pattern = "Random",      radius = 15,  inT = 0.6,  outT = 0.5  },
-        Jitter = { pattern = "Jitter",      radius = 40,  inT = 0.3,  outT = 0.3  },
-        Peek   = { pattern = "StaticBreak", radius = 60,  inT = 0.5,  outT = 0.4  },
-        Blink  = { pattern = "Teleport",    radius = 80,  inT = 0.35, outT = 0.3  },
-        Chaos  = { pattern = "Random",      radius = 100, inT = 0.15, outT = 0.15 },
+        Legit   = { pattern = "Random", radius = 20,  inT = 0.6,  outT = 0.5  },
+        Scatter = { pattern = "Random", radius = 60,  inT = 0.3,  outT = 0.3  },
+        Nebula  = { pattern = "Nebula", radius = 40,  inT = 0.25, outT = 0.3  },
+        Chaos   = { pattern = "Random", radius = 100, inT = 0.15, outT = 0.2  },
     }
     function Void.applyPreset(name)
         local p = Void.PRESETS[name]; if not p then return end
@@ -2871,6 +2920,7 @@ return function(require, LIP, Lib)
         if not LIP.voidPhase or now >= (LIP.voidPhaseUntil or 0) then
             if LIP.voidPhase == "in" then
                 LIP.voidPhase = "out"; LIP.voidPhaseUntil = now + (opts.outTime or 0.5)
+                LIP.voidOutStart = now                 -- marca el inicio del OUT (para el settle anti-tracer)
             else
                 LIP.voidPhase = "in"; LIP.voidPhaseUntil = now + (opts.inTime or 0.5)
                 -- al ENTRAR al void: reload si el cargador está gastado (serverShots = contador unificado real;
@@ -2879,7 +2929,14 @@ return function(require, LIP, Lib)
                 if (LIP.serverShots or 0) >= (Weapon.magSize() or 15) - 1 then Weapon.reload() end
             end
         end
-        LIP.voidShootOk = (LIP.voidPhase == "out")
+        -- SETTLE anti-tracer: al SALIR del void esperamos ~ping ANTES de habilitar disparo. Sin esto, el 1er
+        -- op17 del OUT sale mientras el server TODAVÍA te ve en la pos del void (aún no replicó tu pos real/
+        -- strafe) → la bala nace en el void = "tracer rojo del void→origen client" que te revela. El settle
+        -- deja replicar la pos real primero (era el bug del "falla a 0.13s out of void").
+        local ping = 0.08
+        pcall(function() ping = math.clamp(LP:GetNetworkPing(), 0.03, 0.22) end)
+        local outOk = (LIP.voidPhase == "out") and ((now - (LIP.voidOutStart or 0)) >= ping)
+        LIP.voidShootOk = outOk
         return LIP.voidPhase
     end
 
@@ -3799,6 +3856,10 @@ return function(require, LIP, Lib)
         afc:AddToggle("MultiFire", { Text = "bullet multiplier", Default = false,
             Tooltip = "Padea el array de balas a N pellets = N× daño por disparo legal." })
         afc:AddSlider("BulletMult", { Text = "bullets/shot", Min = 1, Max = 20, Default = 6 })
+        afc:AddSlider("FireMargin", { Text = "fire margin", Min = 0.7, Max = 1, Default = 0.914, Decimals = 3, Suffix = "x",
+            Tooltip = "Firá a este × del firerate del arma. <1 = un pelín más lento que el max (colchón sub-rate) → el AC no te saca por firerate rápido. 0.914 = 91.4%." })
+        afc:AddSlider("FireJitter", { Text = "fire jitter", Min = 0, Max = 0.2, Default = 0.05, Decimals = 2, Suffix = "±",
+            Tooltip = "Randomness ± en el intervalo de disparo → cadencia no-perfecta (no parece bot). El margin da headroom para que nunca baje del firerate." })
         afc:AddToggle("Timer", { Text = "timer", Default = false,
             Tooltip = "⚠ Acelera tu simulación → el juego firea más rápido = MISMO riesgo rps/nc que el viejo rapidfire. Usar con cuidado. Causa FPS drops." })
         afc:AddKeybind("TimerKey", { Text = "timer key", Mode = "Toggle",
@@ -3881,18 +3942,14 @@ return function(require, LIP, Lib)
         vhc:AddToggle("VoidReload", { Text = "void reload", Default = false })
         vhc:AddToggle("AntiDelta", { Text = "anti delta", Default = false,
             Tooltip = "Mueve el origen del void al kill plane. REQUIERE pos spoof." })
-        vhc:AddList("VoidPattern", { Values = { "Random", "Teleport", "Jitter", "StaticBreak", "Nebula" }, Default = "Jitter" })
+        vhc:AddList("VoidPattern", { Values = { "Random", "Nebula" }, Default = "Nebula" })
         vhc:AddSlider("VoidDist", { Text = "radius", Min = 1, Max = 100, Default = 30, Suffix = "studs" })
         vhc:AddSlider("FarDist", { Text = "far dist", Min = 1000000, Max = 500000000, Default = 300000000, Suffix = "st" })
         vhc:AddSlider("MapRadius", { Text = "map radius", Min = 100, Max = 10000, Default = 3000, Suffix = "st" })
-        vhc:AddDropdown("VoidPreset", { Text = "preset", Values = { "Legit", "Jitter", "Peek", "Blink", "Chaos" }, Default = "Jitter",
+        vhc:AddDropdown("VoidPreset", { Text = "preset", Values = { "Legit", "Scatter", "Nebula", "Chaos" }, Default = "Nebula",
             Callback = function(v) Void.applyPreset(v) end })
 
-        local ih = anti:AddToggle("IdleState", { Text = "idle hide", Default = false,
-            Tooltip = "Anti-aim continuo (no dispara): el server te ve teleportando lejos." })
-        local ihc = ih:AddConfig()
-        ihc:AddList("IdlePattern", { Values = { "Random", "Teleport", "Jitter", "StaticBreak", "Nebula" }, Default = "Jitter" })
-        ihc:AddSlider("IdleDist", { Text = "radius", Min = 1, Max = 100, Default = 30, Suffix = "studs" })
+        -- IdleState ("idle hide") REMOVIDO: spameaba remotes sin activarse (posible causa del kick sin disparar).
 
         --== utility (right, weight 7) ==--
         local util = rb:AddPanel("utility", { Column = 2, Weight = 10 })
@@ -3928,6 +3985,13 @@ return function(require, LIP, Lib)
         punc:AddToggle("RapidPunch", { Text = "rapid punch", Default = false,
             Tooltip = "Modificador de auto punch: spamea op36 al rate del slider (sin GST), saltea la anim. Necesita auto punch ON. Rate alto = server puede gatear." })
         punc:AddSlider("PunchRate", { Text = "rate", Min = 2, Max = 30, Default = 10, Suffix = "/s" })
+
+        -- FIX origen del disparo (opt-in, default OFF): fuerza origen+muzzle de cada bala = spoofFakePos.
+        local fso = util:AddToggle("ForceSpoofOrigin", { Text = "spoofed shot origin", Default = false,
+            Tooltip = "Fuerza el origen Y muzzle de cada bala = spoofFakePos (donde el server te ve) → los tracers salen del cuerpo VISIBLE spoofeado, no del real (fix reveal en desync/weld). Cubre disparos auto Y manuales. Wallbang tiene prioridad. Solo con pos-spoof/weld activo." })
+        local fsoc = fso:AddConfig()
+        fsoc:AddSlider("SpoofOriginHeight", { Text = "origin height", Min = -2, Max = 5, Default = 1.5, Decimals = 1, Suffix = "studs",
+            Tooltip = "Altura del origen sobre spoofFakePos (1.5 ≈ cabeza). Ajustá si el tracer sale muy alto/bajo." })
 
         --== visualization (left, weight 3) ==--
         local viz = rb:AddPanel("visualization", { Column = 1, Weight = 3 })
@@ -4101,6 +4165,15 @@ return function(require, LIP, Lib)
         rk3:AddSlider("PropAuraRadius", { Text = "Radius", Min = 3, Max = 40, Default = 12, Suffix = "studs" })
         rk3:AddSlider("PropAuraSpeed", { Text = "Speed", Min = 1, Max = 30, Default = 4 })
         rk3:AddSlider("PropAuraHeight", { Text = "Height", Min = -10, Max = 20, Default = 2, Suffix = "studs" })
+
+        -- DISABLERS (experimental, opt-in, best-effort — pueden no hacer efecto / kickear igual. v51 sin re-decompilar).
+        local rk4 = RK:AddPanel("AC Disablers", { Column = 2 })
+        rk4:AddToggle("DisableMoveChecks", { Text = "disable move checks", Default = false,
+            Tooltip = "Hook GetPropertyChangedSignal en las partes del char p/ props de movimiento (CanCollide/Position/CFrame/velocity/WalkSpeed...) → señal MUERTA = el AC no puede vigilarlas vía changed-signal. Best-effort." })
+        rk4:AddToggle("DisableACReports", { Text = "disable AC reports", Default = false,
+            Tooltip = "Dropea los remotes cliente→server ACTrigger/ACCFrameChanged/ACKickTrigger/ACF → el server no recibe la detección. ⚠ opcodes v50 (verificar en v51)." })
+        rk4:AddToggle("DisableUnequipHook", { Text = "disable UnequipToolsHook", Default = false,
+            Tooltip = "Dropea solo el reporte ACTrigger('UnequipToolsHook') (detección de tool/hook)." })
         rk3:AddSlider("PropAuraMaxMass", { Text = "Max Mass", Min = 20, Max = 2000, Default = 400,
             Tooltip = "Masa máxima de un prop reclamado. Bajo = solo cosas livianas (menos jitter, sin autos/estructural)." })
         rk3:AddToggle("PropAuraCrates", { Text = "Crates Only", Default = false,
@@ -4343,6 +4416,13 @@ return function(require, LIP, Lib)
         LIP.swapOn    = T.SilentAim and T.SilentAim.Value or false
         LIP.meleeOn   = T.MeleeAura and T.MeleeAura.Value or false
         LIP.wallbang  = T.Wallbang and T.Wallbang.Value or false
+        -- FORCE SPOOF ORIGIN (fix reveal): el hook fuerza origen/muzzle = spoofFakePos cuando spoofeado.
+        LIP.forceSpoofOrigin  = (T.ForceSpoofOrigin and T.ForceSpoofOrigin.Value) or false
+        LIP.spoofOriginHeight = (O.SpoofOriginHeight and O.SpoofOriginHeight.Value) or 1.5
+        -- DISABLERS experimentales (opt-in): el hook los lee.
+        LIP.disableMoveChecks  = (T.DisableMoveChecks and T.DisableMoveChecks.Value) or false
+        LIP.disableACReports   = (T.DisableACReports and T.DisableACReports.Value) or false
+        LIP.disableUnequipHook = (T.DisableUnequipHook and T.DisableUnequipHook.Value) or false
         -- bullet multiplier: N pellets por disparo (el Net hook padea el array del op14 del juego/nuestro)
         LIP.bulletMult = (T.MultiFire and T.MultiFire.Value and O.BulletMult and O.BulletMult.Value) or 1
         -- al CAMBIAR de arma: reset del firerate observado + contador → el autofire re-aprende el firerate nuevo
@@ -4370,7 +4450,6 @@ return function(require, LIP, Lib)
         local godOn      = T.Godmode and T.Godmode.Value
         -- Void Spam SOLO con Target Strafe (compone): OUT = strafe-orbit (dispara), IN = void (esconde).
         local voidSpamOn = T.VoidSpam and T.VoidSpam.Value and strafeOn
-        local idleOn     = T.IdleState and T.IdleState.Value     -- viejo void = anti-aim idle continuo
         local cfDesyncOn = T.CFrameDesync and T.CFrameDesync.Value  -- desync self-anchored (sub-tab propia)
         LIP.voidSpamOn   = voidSpamOn
         LIP.voidShootOut = (not T.VoidShootOut) or T.VoidShootOut.Value    -- default on
@@ -4441,9 +4520,9 @@ return function(require, LIP, Lib)
             if LIP.spoofOn or LIP.connRep then Strafe.stop() end
             Godmode.tick()
         elseif holdIdle then
-            -- target protegido/muerto → esconderse temporal (idle anti-aim), sin atacar
+            -- target protegido/muerto → esconderse temporal (anti-aim), sin atacar. Usa el patrón del void spam.
             if LIP.godBase then Godmode.stop() end
-            Void.tick({ dist = O.IdleDist.Value, pattern = O.IdlePattern:GetValue(),
+            Void.tick({ dist = O.VoidDist.Value, pattern = O.VoidPattern:GetValue(),
                         posSpoof = posSpoof, connExploit = connExp })
         elseif strafeOn then
             if LIP.godBase then Godmode.stop() end
@@ -4480,10 +4559,6 @@ return function(require, LIP, Lib)
                     Strafe.tick(st, strafeOpts)
                 end
             else Strafe.stop() end
-        elseif idleOn then
-            if LIP.godBase then Godmode.stop() end
-            Void.tick({ dist = O.IdleDist.Value, pattern = O.IdlePattern:GetValue(),
-                        posSpoof = posSpoof, connExploit = connExp })
         elseif cfDesyncOn then
             -- CFRAME DESYNC: desync continuo self-anchored (anchor = tu pos real). Full customizable, sub-tab propia.
             if LIP.godBase then Godmode.stop() end
