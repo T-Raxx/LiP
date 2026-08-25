@@ -137,10 +137,18 @@ return function(require, LIP, Lib)
                     local op = p[1]
                     -- marca del último disparo (juego O nuestro) → HitEffects correlaciona con la pérdida
                     -- de vida del enemigo para detectar hits/kills.
-                    if op == D.OP.SHOOT then D.lastShotT = os.clock() end
+                    if op == D.OP.SHOOT then
+                        D.lastShotT = os.clock()
+                        -- CONTADOR UNIFICADO server-side: TODO op17 (usuario mouse1 + nuestro autofire) = 1
+                        -- bala de munición (el server decrementa ammo por op17, sin importar los pellets).
+                        -- Reset en op43 (OnReload). Es el tracker REAL: ammo = mag - serverShots. El auto-reload
+                        -- lo usa → recarga antes de quedar en blanks (op17 con ammo 0 = fantasmas + kick AC v50) y
+                        -- NUNCA recarga un cargador lleno (server rechaza = unequip). El HUD de balas lo lee.
+                        D.serverShots = (D.serverShots or 0) + 1
+                    end
+                    -- reload (NUESTRO o del juego) rellena el cargador → reset del contador unificado.
+                    if op == D.OP.RELOAD then D.serverShots = 0 end
                     -- OBSERVA FIRERATE REAL (op14 del juego, no nuestro autofire) → no sobre-disparar.
-                    -- (El conteo de balas para el reload vive en Weapon.fireOne, NO acá: este hook
-                    --  persiste entre reloads y no se puede actualizar sin rejoin limpio.)
                     if op == D.OP.SHOOT and not D._selfFiring then
                         -- PELLET COUNT por arma: las escopetas (SPAS/DB) mandan N pellets por tiro. Lo aprendemos
                         -- del op14 REAL del juego (dispará 1 vez con la escopeta) → el autofire replica N pellets.
@@ -1816,34 +1824,59 @@ return function(require, LIP, Lib)
     end
     Weapon.magSize = magSize
 
-    -- RELOAD = disparar el reload REAL del juego simulando la tecla R (ContextAction "Reload" = KeyCode.R,
-    -- BClient L790). El juego reproduce su ANIMACIÓN y firea MagDrop→OnReload con el timing EXACTO que el
-    -- server valida (OnReload al terminar la anim). Reconstruirlo a mano (op42→wait→op40) con timing
-    -- ADIVINADO = duración inválida = UNEQUIP + flag AC (el problema viejo). R es AC-safe por definición:
-    -- es literalmente recargar. El juego gatea solo (no recarga con cargador lleno / ragdolleado) y maneja
-    -- escopeta (per-shell) por su cuenta. Net observa el op40 real que dispara → aprende observedReloadTime.
-    -- NOTA: el autofire firea op17 DIRECTO (no decrementa el 'ammo' cliente del juego), así que si nunca
-    -- disparaste manual, el cargador del juego puede verse lleno y R será no-op. Es SEGURO igual (no unequip).
+    -- lee la munición REAL del display del juego (PlayerGui.ScreenGui...itemInfo = "N / M" = actual/cargador).
+    -- Sirve para SINCRONIZAR serverShots al equipar (fix del mismatch mid-carga: cargar el cheat con cargador
+    -- parcial). Después Net toma el conteo — el display del juego queda stale con autofire directo, así que
+    -- SOLO se lee como estado inicial (no continuo, o pelearía con nuestro contador).
+    local function gameAmmo()
+        local pg = LP:FindFirstChild("PlayerGui"); if not pg then return nil end
+        local lbl = pg:FindFirstChild("itemInfo", true)
+        if lbl and lbl:IsA("TextLabel") then
+            local n, m = tostring(lbl.Text):match("(%d+)%s*/%s*(%d+)")
+            if n and m then return tonumber(n), tonumber(m) end
+        end
+        return nil
+    end
+    Weapon.gameAmmo = gameAmmo
+
+    -- tiempo REAL de reload por arma: DB del calibrador (observa op45→op43 del reload del juego → reloadtime)
+    -- > observedReloadTime (aprendido en vivo por Net del reload manual) > 2.0 fallback.
+    local function reloadTime()
+        local tool = firearm(); local name = tool and tool.Name
+        local e = name and LIP.firerateDB and LIP.firerateDB[name]
+        if type(e) == "table" and type(e.reloadtime) == "number" and e.reloadtime > 0.2 then return e.reloadtime end
+        return LIP.observedReloadTime or 2.0
+    end
+    Weapon.reloadTime = reloadTime
+
+    -- RELOAD = protocolo REAL del juego: MagDrop(op45) → esperar la duración REAL de la anim → OnReload(op43,
+    -- mag, GST). El server valida el timestamp del GST del OnReload (~animLen tras el MagDrop) → timing REAL
+    -- (por arma) = válido = rellena munición SIN unequip. Dos claves para no comer flag AC v50:
+    --   · timing REAL por arma (adivinarlo = duración inválida = unequip — el bug viejo).
+    --   · recargar SOLO con el cargador realmente gastado (serverShots alto). Recargar un cargador LLENO =
+    --     server rechaza = unequip. Por eso el trigger (tickAuto) usa el contador UNIFICADO (Net: usuario+cheat).
+    -- El R-key NO sirve: el autofire firea op17 directo, el 'ammo' cliente del juego queda lleno → R es no-op
+    -- → munición server no se rellena → blanks (op17 sin munición) → kick. Este path la rellena de verdad.
     function Weapon.reload()
         if LIP.reloading then return end
         local tool = firearm(); if not tool then return end
+        local mag = magSize()
+        local rt  = reloadTime()
         LIP.reloading = true
+        LIP._selfReload = true                 -- Net NO aprende reload-time de NUESTRO reload (queremos el del juego)
         LIP._lastReloadReal = os.clock()
         task.spawn(function()
-            local VIM = game:GetService("VirtualInputManager")
-            pcall(function()
-                VIM:SendKeyEvent(true,  Enum.KeyCode.R, false, game)
-                task.wait(0.03)
-                VIM:SendKeyEvent(false, Enum.KeyCode.R, false, game)
-            end)
-            -- cooldown ~ duración real del reload (Net la aprende del op40 real) + margen. Reset del contador
-            -- (asumimos recargado; si R fue no-op, igual reseteamos → no spameamos R cada frame).
-            task.wait((LIP.observedReloadTime or 2.0) + 0.15)
-            LIP.shotsFired = 0
+            pcall(function() LIP.fire(LIP.OP.MAGDROP, tool) end)
+            task.wait(rt)
+            local t2 = firearm() or tool
+            pcall(function() LIP.fire(LIP.OP.RELOAD, t2, mag, GST()) end)
+            LIP.serverShots = 0; LIP.shotsFired = 0
+            LIP._selfReload = false
+            task.wait(0.12)                    -- que el op43 registre server-side antes de reanudar el fuego
             LIP.reloading = false
         end)
     end
-    Weapon.instantReload = Weapon.reload   -- alias UI (botón "force reload" / keybind)
+    Weapon.instantReload = Weapon.reload       -- alias UI (botón "force reload" / keybind)
 
     -- construye el bullet {origin, muzzle, hitPos, hitPart, hitPart.Position, objspace}
     -- origin: si el server te ve en otra pos (desync spoofOn O connection weld connRep), el origin debe ser
@@ -1957,6 +1990,13 @@ return function(require, LIP, Lib)
         -- Actualizamos _lastAutoFire para no doble-firar apenas soltás M1 (mantiene el espaciado).
         if UIS:IsMouseButtonPressed(Enum.UserInputType.MouseButton1) then LIP._lastAutoFire = now; return end
         if LIP.reloading or LIP.attackHold or LIP.awGrabbing then LIP._lastAutoFire = now; return end
+        -- AUTO-RELOAD (ANTES de la pausa-void → también recarga en void-spam = "Reloading In Void"; el
+        -- force-void de voidStep la esconde mientras LIP.reloading). serverShots = contador unificado (Net,
+        -- usuario+cheat) = munición real. Recarga con 1 bala de margen: antes de blanks (op17 con ammo 0 =
+        -- kick AC v50) y solo con el cargador realmente gastado (recargar lleno = unequip).
+        if T("AutoReload") ~= false and (LIP.serverShots or 0) >= magSize() - 1 then
+            Weapon.reload(); return
+        end
         -- VOID SPAM: solo disparar OUT del void; BAIT: origin en void → no registra
         if LIP.voidSpamOn and LIP.voidShootOut and not LIP.voidShootOk then return end
         if LIP.strafePhase == "bait" then return end
@@ -1969,10 +2009,6 @@ return function(require, LIP, Lib)
             local ref = ((LIP.spoofOn or LIP.connRep) and LIP.spoofFakePos)
                         or (LIP.wallbang and LIP.cachedOrigin) or (h and h.Position)
             if ref and (LIP.cachedHitPos - ref).Magnitude > (O("FireRange") or 200) then return end
-        end
-        -- AUTO-RELOAD al agotar el cargador (timing real, no instantáneo; el void spam recarga escondido)
-        if T("AutoReload") ~= false and not LIP.voidSpamOn and (LIP.shotsFired or 0) >= magSize() then
-            Weapon.reload(); return
         end
         -- INTERVALO base = firerate REAL del arma (DB). Sin calibrar = 0.5s (2/s) ultra seguro.
         local fr = weaponFirerate()
@@ -2012,7 +2048,7 @@ return function(require, LIP, Lib)
     end
 
     -- respawn: resetea el contador (el arma nueva viene con el cargador lleno)
-    LP.CharacterAdded:Connect(function() LIP.shotsFired = 0; LIP.reloading = false end)
+    LP.CharacterAdded:Connect(function() LIP.shotsFired = 0; LIP.serverShots = 0; LIP.reloading = false end)
 
     -- ── DIAGNÓSTICO DE UNEQUIP (solo si WeaponDebug ON) ──────────────────────────
     -- Loguea el estado cuando el server te quita el arma disparando (shots/mag, dest, reload). Off por
@@ -2835,8 +2871,10 @@ return function(require, LIP, Lib)
                 LIP.voidPhase = "out"; LIP.voidPhaseUntil = now + (opts.outTime or 0.5)
             else
                 LIP.voidPhase = "in"; LIP.voidPhaseUntil = now + (opts.inTime or 0.5)
-                -- al ENTRAR al void: reload si el cargador está gastado (recargás escondido; force-void lo cubre)
-                if opts.voidReload and (LIP.shotsFired or 0) >= (Weapon.magSize() or 15) then Weapon.reload() end
+                -- al ENTRAR al void: reload si el cargador está gastado (serverShots = contador unificado real;
+                -- recargás escondido, force-void lo cubre). Sin gate del toggle: quedar en blanks = kick AC.
+                -- (tickAuto ya lo cubre universal; esto es redundancia segura — reload() guarda el doble.)
+                if (LIP.serverShots or 0) >= (Weapon.magSize() or 15) - 1 then Weapon.reload() end
             end
         end
         LIP.voidShootOk = (LIP.voidPhase == "out")
@@ -3085,6 +3123,154 @@ return function(require, LIP, Lib)
     end
 
     return Void
+end
+
+end)()
+_MODS["Visuals.AmmoHUD"] = (function()
+-- Visuals/AmmoHUD.lua — FACTORY. Contador de balas server-side ANCLADO a la Tool física del arma.
+-- El autofire firea op17 directo (no toca el 'ammo' cliente del juego) → el display del juego ("15/15")
+-- queda STALE. Este HUD muestra la munición REAL = magSize - LIP.serverShots (contador unificado de Net,
+-- usuario+cheat) → encaja con el auto-reload (protocolo real). BillboardGui adornado al Handle (sigue el
+-- arma en 3D), parent gethui (fuera del PlayerGui = más safe). Efectos: outline de texto (UIStroke), glow
+-- pulsante (UIStroke animado + UIGradient), color por nivel (verde→amarillo→rojo), fill bar, fade en reload.
+return function(require, LIP, Lib)
+    local Players      = game:GetService("Players")
+    local RunService   = game:GetService("RunService")
+    local TweenService = game:GetService("TweenService")
+    local LP = Players.LocalPlayer
+    local AmmoHUD = {}
+    local Weapon                                            -- lazy
+
+    local function T(f) local t = Lib.Toggles[f]; return t and t.Value end
+    local function O(f) local o = Lib.Options[f]; return o and o.Value end
+
+    local gui, frame, fstroke, grad, label, tstroke, magTxt, bar, barFill, pulseT
+    local curTool
+
+    local function guiParent()
+        local ok, h = pcall(function() return gethui() end)
+        if ok and h then return h end
+        return game:FindService("CoreGui") or game.CoreGui
+    end
+
+    -- color por fracción de munición: 1=verde, 0.5=amarillo, 0=rojo
+    local GREEN, YELLOW, RED = Color3.fromRGB(120, 255, 150), Color3.fromRGB(255, 220, 90), Color3.fromRGB(255, 90, 90)
+    local function levelColor(frac)
+        frac = math.clamp(frac, 0, 1)
+        if frac > 0.5 then return YELLOW:Lerp(GREEN, (frac - 0.5) * 2)
+        else return RED:Lerp(YELLOW, frac * 2) end
+    end
+
+    function AmmoHUD.destroy()
+        if gui then pcall(function() gui:Destroy() end) end
+        gui, frame, fstroke, grad, label, tstroke, magTxt, bar, barFill = nil, nil, nil, nil, nil, nil, nil, nil, nil
+        curTool = nil
+    end
+    LIP.onCleanup(AmmoHUD.destroy)
+
+    local function build(tool)
+        AmmoHUD.destroy()
+        local handle = tool:FindFirstChild("Handle") or tool:FindFirstChildWhichIsA("BasePart")
+        if not handle then return end
+        curTool = tool
+
+        gui = Instance.new("BillboardGui")
+        gui.Name = "\0\0"                                   -- nombre nulo (evita scans por nombre)
+        gui.Adornee = handle
+        gui.Size = UDim2.fromOffset(150, 74)
+        gui.StudsOffset = Vector3.new(0, 2.6, 0)
+        gui.AlwaysOnTop = true
+        gui.LightInfluence = 0
+        gui.MaxDistance = 500
+        gui.Parent = guiParent()
+
+        frame = Instance.new("Frame")
+        frame.Size = UDim2.fromScale(1, 1)
+        frame.BackgroundColor3 = Color3.fromRGB(12, 12, 18)
+        frame.BackgroundTransparency = 0.3
+        frame.Parent = gui
+        Instance.new("UICorner", frame).CornerRadius = UDim.new(0, 10)
+        grad = Instance.new("UIGradient", frame)           -- sheen sutil
+        grad.Color = ColorSequence.new(Color3.fromRGB(40, 40, 60), Color3.fromRGB(12, 12, 18))
+        grad.Rotation = 90
+        fstroke = Instance.new("UIStroke", frame)          -- glow (se anima)
+        fstroke.Color = GREEN; fstroke.Thickness = 2; fstroke.Transparency = 0.1
+        fstroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+
+        label = Instance.new("TextLabel")                  -- munición grande
+        label.Size = UDim2.fromScale(1, 0.62)
+        label.Position = UDim2.fromScale(0, 0.04)
+        label.BackgroundTransparency = 1
+        label.Font = Enum.Font.GothamBlack
+        label.TextScaled = true
+        label.Text = "0 / 0"
+        label.TextColor3 = GREEN
+        label.Parent = frame
+        tstroke = Instance.new("UIStroke", label)          -- outline de texto
+        tstroke.Color = Color3.fromRGB(0, 0, 0); tstroke.Thickness = 2.5; tstroke.Transparency = 0.15
+
+        bar = Instance.new("Frame")                        -- fill bar (fracción)
+        bar.AnchorPoint = Vector2.new(0.5, 1)
+        bar.Position = UDim2.new(0.5, 0, 1, -8)
+        bar.Size = UDim2.new(0.82, 0, 0, 7)
+        bar.BackgroundColor3 = Color3.fromRGB(30, 30, 40)
+        bar.BackgroundTransparency = 0.2
+        bar.Parent = frame
+        Instance.new("UICorner", bar).CornerRadius = UDim.new(1, 0)
+        barFill = Instance.new("Frame")
+        barFill.Size = UDim2.fromScale(1, 1)
+        barFill.BackgroundColor3 = GREEN
+        barFill.BorderSizePixel = 0
+        barFill.Parent = bar
+        Instance.new("UICorner", barFill).CornerRadius = UDim.new(1, 0)
+
+        -- fade-in
+        frame.BackgroundTransparency = 1; label.TextTransparency = 1
+        TweenService:Create(frame, TweenInfo.new(0.25), { BackgroundTransparency = 0.3 }):Play()
+        TweenService:Create(label, TweenInfo.new(0.25), { TextTransparency = 0 }):Play()
+    end
+
+    -- ¿la tool es un arma de fuego? (tiene Handle con Muzzle o el juego le puso ammo). Si no, no mostramos
+    -- (melee/handcuffs no tienen cargador). Heurística: Handle.Muzzle o magByWeapon conocido.
+    local function isFirearm(tool)
+        local h = tool:FindFirstChild("Handle")
+        if h and h:FindFirstChild("Muzzle") then return true end
+        return (LIP.magByWeapon and LIP.magByWeapon[tool.Name]) ~= nil
+    end
+
+    function AmmoHUD.tick()
+        if not T("AmmoCounter") then if gui then AmmoHUD.destroy() end return end
+        local tool = LP.Character and LP.Character:FindFirstChildOfClass("Tool")
+        if not (tool and isFirearm(tool)) then if gui then AmmoHUD.destroy() end return end
+        if tool ~= curTool or not gui then build(tool) end
+        if not gui then return end
+
+        Weapon = Weapon or require("Combat.Weapon")
+        local mag  = (Weapon.magSize and Weapon.magSize()) or 15
+        local ammo = math.max(0, mag - (LIP.serverShots or 0))
+        local frac = mag > 0 and (ammo / mag) or 0
+        local col  = levelColor(frac)
+
+        if LIP.reloading then
+            label.Text = "RELOAD"
+            -- pulso del glow durante la recarga
+            local t = tick() * 6
+            local a = 0.5 + 0.4 * math.sin(t)
+            label.TextColor3 = Color3.fromRGB(120, 190, 255)
+            fstroke.Color = Color3.fromRGB(120, 190, 255); fstroke.Transparency = 0.6 - 0.5 * math.abs(math.sin(t))
+            barFill.BackgroundColor3 = Color3.fromRGB(120, 190, 255)
+            barFill.Size = UDim2.fromScale(a, 1)           -- barrido de recarga
+        else
+            label.Text = ammo .. " / " .. mag
+            label.TextColor3 = col
+            fstroke.Color = col
+            fstroke.Transparency = (ammo <= 1) and (0.15 + 0.6 * math.abs(math.sin(tick() * 8))) or 0.15  -- parpadea vacío
+            barFill.BackgroundColor3 = col
+            barFill.Size = UDim2.fromScale(frac, 1)
+        end
+    end
+
+    return AmmoHUD
 end
 
 end)()
@@ -3620,11 +3806,13 @@ return function(require, LIP, Lib)
         afc:AddSlider("TimerReload", { Text = "reload mult", Min = 1, Max = 3, Default = 2, Decimals = 2, Suffix = "x" })
 
         local ar = gen:AddToggle("AutoReload", { Text = "auto reload", Default = true,
-            Tooltip = "Al agotar el cargador simula la tecla R = el RELOAD REAL del juego (anim + timing correctos = AC-safe, sin unequip). Solo en auto fire." })
+            Tooltip = "Recarga sola antes de quedar en blanks (protocolo real MagDrop→OnReload, timing por arma). Usa el contador UNIFICADO server-side (usuario+cheat) → sin unequip, sin kick por munición 0. Solo en auto fire." })
         local arc = ar:AddConfig()
         arc:AddSlider("ReloadAmmo", { Text = "mag size (fallback)", Min = 1, Max = 120, Default = 15,
-            Tooltip = "Cuándo disparar el auto-reload (nº de disparos). Se auto-aprende por arma del reload real; esto es solo el fallback sin calibrar." })
+            Tooltip = "Tamaño de cargador fallback (sin calibrar). Se auto-aprende por arma del reload real (op43)." })
         arc:AddSlider("ShotgunPellets", { Text = "shotgun pellets", Min = 1, Max = 16, Default = 8 })
+        arc:AddToggle("AmmoCounter", { Text = "ammo counter (tool)", Default = true,
+            Tooltip = "Contador de balas server-side REAL anclado a la Tool física (el display del juego queda stale con autofire directo). Glow + color por nivel + fade en reload." })
         arc:AddButton("force reload", function() Weapon.instantReload() end)
         arc:AddKeybind("ReloadKey", { Text = "reload key", Mode = "Toggle", Callback = function() Weapon.instantReload() end })
 
@@ -4009,6 +4197,7 @@ return function(require, LIP, Lib)
     local PropAura = require("Movement.PropAura")
     local HitFX   = require("Visuals.HitEffects")
     local CrossHUD = require("Visuals.CrosshairHUD")
+    local AmmoHUD = require("Visuals.AmmoHUD")
     local UI      = require("UI")
 
     local Window = Lib:CreateWindow({ Title = "life in prison", Size = Vector2.new(834, 586) })
@@ -4158,7 +4347,17 @@ return function(require, LIP, Lib)
         do
             local et = LP.Character and LP.Character:FindFirstChildOfClass("Tool")
             local en = et and et.Name
-            if en ~= LIP.curWeapon then LIP.curWeapon = en; LIP.observedFirerate = nil; LIP.shotsFired = 0 end
+            if en ~= LIP.curWeapon then
+                LIP.curWeapon = en; LIP.observedFirerate = nil; LIP.shotsFired = 0; LIP.serverShots = 0
+                -- SYNC serverShots desde el display real del juego (fix mismatch mid-carga). Diferido para que
+                -- el display actualice tras el equip; solo si no disparaste nada en el ínterin.
+                if en then task.delay(0.3, function()
+                    if LIP.curWeapon == en and (LIP.serverShots or 0) == 0 then
+                        local cur, mg = Weapon.gameAmmo()
+                        if cur and mg and mg > 0 then LIP.serverShots = math.max(0, mg - cur) end
+                    end
+                end) end
+            end
         end
         local filters = { teamCheck = T.TeamCheck.Value, friendCheck = T.FriendCheck.Value,
                           ffCheck = T.FFCheck and T.FFCheck.Value }
@@ -4206,6 +4405,7 @@ return function(require, LIP, Lib)
             LIP.hudTargetName = (eng and LIP.target) and LIP.target.Name or nil
             LIP.hudResolved   = LIP.target and Strafe.confidence(LIP.target) or 0
             LIP.hudReloadVoid = (LIP.reloading and LIP.voidPhase == "in") or false
+            pcall(AmmoHUD.tick)   -- contador de balas server-side anclado a la Tool física
             -- killed-wait: armá el watch mientras enganchás un focus VIVO; al morir → "waiting for HRP"
             -- hasta que respawnee vivo + sin ForceField (o se vaya del server).
             if strafeOn and LIP.target and LIP.target.Character then

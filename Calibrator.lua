@@ -15,7 +15,9 @@ local UIS         = game:GetService("UserInputService")
 local RunService  = game:GetService("RunService")
 local GuiService  = game:GetService("GuiService")
 
-local SHOOT = 17
+local SHOOT   = 17   -- FirearmBullets (firerate)
+local RELOAD  = 43   -- OnReload  (fin del reload → delta vs MagDrop = reloadtime)
+local MAGDROP = 45   -- MagDrop   (inicio del reload)
 local FILE  = "LiP_firerates.json"
 local NOISE_LO, NOISE_HI = 0.03, 3
 
@@ -40,8 +42,10 @@ if canFile and isfile and isfile(FILE) then
 end
 db = db or {}
 local raw, last = {}, {}
+local magDropT, rdeltas = {}, {}      -- reload: MagDrop-time por arma + deltas de reload acumulados
 for name, e in pairs(db) do
     if type(e) == "table" and type(e._deltas) == "table" then raw[name] = e._deltas end
+    if type(e) == "table" and type(e._rdeltas) == "table" then rdeltas[name] = e._rdeltas end
 end
 
 local function robustMin(sorted)
@@ -51,11 +55,20 @@ local function robustMin(sorted)
     return sorted[1]
 end
 local function recompute(name)
-    local ds = raw[name]; if not ds or #ds < 2 then return end
-    local s = table.clone(ds); table.sort(s)
-    local function pct(p) return s[math.max(1, math.floor(p * #s))] end
-    db[name] = { firerate = robustMin(s), min = s[1], p10 = pct(0.10), p25 = pct(0.25),
-                 median = pct(0.50), max = s[#s], samples = #s, _deltas = ds }
+    local e = db[name]; if type(e) ~= "table" then e = {}; db[name] = e end
+    local ds = raw[name]
+    if ds and #ds >= 2 then
+        local s = table.clone(ds); table.sort(s)
+        local function pct(p) return s[math.max(1, math.floor(p * #s))] end
+        e.firerate = robustMin(s); e.min = s[1]; e.p10 = pct(0.10); e.p25 = pct(0.25)
+        e.median = pct(0.50); e.max = s[#s]; e.samples = #s; e._deltas = ds
+    end
+    local rd = rdeltas[name]                                  -- reload time = mediana (el reload es ~constante)
+    if rd and #rd >= 1 then
+        local rs = table.clone(rd); table.sort(rs)
+        e.reloadtime = rs[math.max(1, math.floor(0.5 * #rs))]
+        e.reloadsamples = #rs; e._rdeltas = rd
+    end
 end
 local saveQueued = false
 local function save(force)
@@ -66,8 +79,8 @@ local function save(force)
     task.delay(0.5, function() saveQueued = false
         pcall(function() writefile(FILE, HttpService:JSONEncode(db)) end) end)
 end
-local function resetWeapon(name) raw[name] = nil; db[name] = nil; last[name] = nil; save(true) end
-local function resetAll() for k in pairs(db) do db[k] = nil end; raw = {}; last = {}; save(true) end
+local function resetWeapon(name) raw[name] = nil; rdeltas[name] = nil; magDropT[name] = nil; db[name] = nil; last[name] = nil; save(true) end
+local function resetAll() for k in pairs(db) do db[k] = nil end; raw = {}; last = {}; rdeltas = {}; magDropT = {}; save(true) end
 
 -- ── observer hook (passthrough) ─────────────────────────────────────────────
 local orig
@@ -85,6 +98,20 @@ local ok = pcall(function()
                         local ds = raw[name]; if not ds then ds = {}; raw[name] = ds end
                         ds[#ds + 1] = dt
                         if #ds > 800 then table.remove(ds, 1) end
+                        recompute(name); save()
+                    end
+                end
+            elseif a1 == MAGDROP and typeof(a2) == "Instance" then
+                magDropT[a2.Name] = os.clock()
+            elseif a1 == RELOAD and typeof(a2) == "Instance" then
+                local name = a2.Name
+                local mt = magDropT[name]; magDropT[name] = nil
+                if mt then
+                    local dt = os.clock() - mt
+                    if dt > 0.3 and dt < 6 then
+                        local rd = rdeltas[name]; if not rd then rd = {}; rdeltas[name] = rd end
+                        rd[#rd + 1] = dt
+                        if #rd > 40 then table.remove(rd, 1) end
                         recompute(name); save()
                     end
                 end
@@ -180,7 +207,8 @@ local function layout()
         if name and i <= nrow then
             local e  = db[name]
             local fr = e.firerate or 0
-            d.Text = string.format("%-13s %.4fs  %5.1f/s   n=%d", name:sub(1, 13), fr, fr > 0 and 1/fr or 0, e.samples or 0)
+            local rl = e.reloadtime and string.format("r%.2fs", e.reloadtime) or "r?"
+            d.Text = string.format("%-12s %.4fs %4.1f/s n%d %s", name:sub(1, 12), fr, fr > 0 and 1/fr or 0, e.samples or 0, rl)
             d.Color = (e.samples or 0) >= 8 and COL.good or COL.warn
             d.Position = P(PAD + math.floor(2*S), rowY0 + (i - 1) * ROW_H)
             d.Visible = hud.visible
