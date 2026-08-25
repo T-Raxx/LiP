@@ -106,17 +106,16 @@ end
 
 end)()
 _MODS["Net"] = (function()
--- Net.lua — FACTORY. UN solo __namecall hook unificado (regla LiP: 1 hook, no apilar).
--- Passive, PRECACHE model: el driver (main) computa afuera del hook los targets; el hook
--- SOLO escribe arrays (cero reentrancy → no rompe la secuencia síncrona del disparo).
+-- Net.lua — FACTORY. UN solo __namecall hook (regla LiP: 1 hook, no apilar).
+-- ARQUITECTURA reload-safe: el hook es un SHELL DELGADO instalado 1 vez (persiste, no se desinstala) que
+-- delega TODA la lógica a `LIP._onNamecall`, REDEFINIDA en cada carga. Así, cambios de lógica (contadores,
+-- swaps, opcodes) se toman en RELOAD sin rejoin — arregla el gotcha "el hook viejo persiste sin el código
+-- nuevo". (La 1ra vez tras cambiar el SHELL sí hace falta 1 rejoin para instalarlo.)
 --
--- Firmas (RemoteEvent multiplexado netevgen, opcode=arg1). Opcodes centralizados en LIP.OP
--- (Core/State.lua) — acá se leen dinámicos por D.OP para que un bump de versión + reload los tome
--- sin rejoin. v50: SHOOT=17, MELEE=19, RELOAD=43, MAGDROP=45, TURRET=59.
---   SHOOT FirearmBullets: FireServer(OP.SHOOT, Tool, bullets, GST)  bullets[i]={org,muz,hitPos,hitPart,partPos,objspace}
---   MELEE OnMeleeRemote  : FireServer(OP.MELEE, Tool, GST, hitPart, objspace)
--- GST() lo genera el cliente (stub/token) → lo dejamos intacto, solo redirigimos el HIT.
--- Reload-safe: hook instalado UNA vez (flag getgenv), lee getgenv().LIP dinámico.
+-- Firmas v50 (RemoteEvent multiplexado netevgen, opcode=arg1; centralizados en LIP.OP):
+--   SHOOT(17) FirearmBullets: FireServer(17, Tool, bullets, GST)  bullets[i]={org,muz,hitPos,hitPart,partPos,objspace}
+--   MELEE(19) OnMeleeRemote  : FireServer(19, Tool, GST, hitPart, objspace)
+--   RELOAD(43)/MAGDROP(45)   : reload; TURRET(59). GST intacto (lo genera el cliente).
 return function(require, LIP, Lib)
     local Net = {}
     local getncm  = getnamecallmethod
@@ -127,115 +126,115 @@ return function(require, LIP, Lib)
 
     function Net.install()
         LIP.RE = LIP.RE or (LIP.Events and LIP.Events:FindFirstChild("RemoteEvent"))
+
+        -- ── LÓGICA (redefinida cada carga → el shell persistente la toma sin rejoin) ──────────────
+        -- Recibe `orig` (el namecall real) para poder re-firar con args modificados (silent aim/multiplier/
+        -- melee/turret). Devuelve: (true, <resultado de orig>) si MANEJÓ el call (swap); false = passthrough.
+        function LIP._onNamecall(self, orig, ...)
+            local D = getgenv().LIP
+            if not (D and self == D.RE and getncm() == "FireServer") then return false end
+            local p = table.pack(...)
+            local op = p[1]
+
+            -- ── OBSERVE (sin return; siempre corre) ──
+            if op == D.OP.SHOOT then
+                D.lastShotT = os.clock()
+                -- CONTADOR UNIFICADO server-side: TODO op17 (usuario mouse1 + nuestro autofire) = 1 bala
+                -- (el server decrementa ammo por op17, sin importar pellets). Reset en op43. ammo = mag -
+                -- serverShots. El auto-reload lo usa (recarga antes de blanks + nunca cargador lleno). HUD lo lee.
+                D.serverShots = (D.serverShots or 0) + 1
+            end
+            if op == D.OP.RELOAD then D.serverShots = 0 end          -- reload (nuestro o del juego) rellena → reset
+
+            if op == D.OP.SHOOT and not D._selfFiring then
+                -- PELLET COUNT por arma (escopetas mandan N pellets/tiro) — el autofire lo replica.
+                do
+                    local bl, wt = p[3], p[2]
+                    if type(bl) == "table" and #bl >= 1 and typeof(wt) == "Instance" then
+                        D.pelletsByWeapon = D.pelletsByWeapon or {}
+                        D.pelletsByWeapon[wt.Name] = #bl
+                    end
+                end
+                -- FIRERATE real (op17 del JUEGO, no el nuestro). Floor 0.07s rechaza pellet-bursts/doble-click.
+                local now = os.clock()
+                if D._lastRealShot then
+                    local dt = now - D._lastRealShot
+                    if dt > 0.07 and dt < 2 then D.observedFirerate = dt end
+                end
+                D._lastRealShot = now
+            end
+
+            if op == D.OP.MAGDROP and not D._selfReload then D._magDropT = os.clock() end
+            if op == D.OP.RELOAD and not D._selfReload then
+                local mag, wtool = p[3], p[2]
+                -- MAG por arma: MAX(existente, arg). Escopeta = per-slug (OnReload manda 2,3,..8) → el MAX
+                -- converge al cargador real (8) sin corromperse. (magSize() ya prefiere el denominador del
+                -- display del juego "N / M"; esto es fallback.)
+                if type(mag) == "number" and mag >= 2 and mag <= 200 and typeof(wtool) == "Instance" then
+                    D.magByWeapon = D.magByWeapon or {}
+                    D.magByWeapon[wtool.Name] = math.max(D.magByWeapon[wtool.Name] or 0, mag)
+                end
+                if D._magDropT then
+                    local rt = os.clock() - D._magDropT
+                    if rt > 0.3 and rt < 6 then D.observedReloadTime = rt end
+                    D._magDropT = nil
+                end
+            end
+
+            -- ── SWAP (return true, orig(self, modificado)) ──
+            if op == D.OP.SHOOT then
+                local bullets = p[3]
+                local mult = D.bulletMult or 1
+                local swap = D.swapOn and D.cachedHitPart and D.cachedHitPos
+                if type(bullets) == "table" and (swap or mult > 1) then
+                    if swap then
+                        for i = 1, #bullets do
+                            local b = bullets[i]
+                            if type(b) == "table" then
+                                b[3] = D.cachedHitPos; b[4] = D.cachedHitPart; b[5] = D.cachedHitPos; b[6] = ZERO
+                                if D.wallbang and D.cachedOrigin then b[1] = D.cachedOrigin; b[2] = D.cachedOrigin end
+                            end
+                        end
+                    end
+                    local base = #bullets
+                    if mult > 1 and base > 0 then
+                        for k = 1, base * (mult - 1) do
+                            local s = bullets[((k - 1) % base) + 1]
+                            if type(s) == "table" then bullets[base + k] = { s[1], s[2], s[3], s[4], s[5], s[6] } end
+                        end
+                    end
+                    return true, orig(self, unpackf(p, 1, p.n))
+                end
+            elseif op == D.OP.MELEE and D.meleeOn and D.meleePart then
+                p[4] = D.meleePart; p[5] = ZERO
+                return true, orig(self, unpackf(p, 1, p.n))
+            elseif op == D.OP.TURRET and p[3] == 2 and D.swapOn and D.cachedHitPart and D.cachedHitPos then
+                local hits = p[4]
+                if type(hits) == "table" then
+                    for i = 1, #hits do
+                        local hh = hits[i]
+                        if type(hh) == "table" then
+                            hh[3] = D.cachedHitPos; hh[4] = D.cachedHitPart; hh[5] = D.cachedHitPos; hh[6] = ZERO
+                        end
+                    end
+                    return true, orig(self, unpackf(p, 1, p.n))
+                end
+            end
+            return false                                             -- passthrough
+        end
+
+        -- ── SHELL (instalado 1 vez; delega a LIP._onNamecall dinámico) ──
         if getgenv().__LIP_HOOK then return end
         local orig
         local ok = pcall(function()
             orig = hookmm(game, "__namecall", newcc(function(self, ...)
                 local D = getgenv().LIP
-                if D and self == D.RE and getncm() == "FireServer" then
-                    local p = table.pack(...)
-                    local op = p[1]
-                    -- marca del último disparo (juego O nuestro) → HitEffects correlaciona con la pérdida
-                    -- de vida del enemigo para detectar hits/kills.
-                    if op == D.OP.SHOOT then
-                        D.lastShotT = os.clock()
-                        -- CONTADOR UNIFICADO server-side: TODO op17 (usuario mouse1 + nuestro autofire) = 1
-                        -- bala de munición (el server decrementa ammo por op17, sin importar los pellets).
-                        -- Reset en op43 (OnReload). Es el tracker REAL: ammo = mag - serverShots. El auto-reload
-                        -- lo usa → recarga antes de quedar en blanks (op17 con ammo 0 = fantasmas + kick AC v50) y
-                        -- NUNCA recarga un cargador lleno (server rechaza = unequip). El HUD de balas lo lee.
-                        D.serverShots = (D.serverShots or 0) + 1
-                    end
-                    -- reload (NUESTRO o del juego) rellena el cargador → reset del contador unificado.
-                    if op == D.OP.RELOAD then D.serverShots = 0 end
-                    -- OBSERVA FIRERATE REAL (op14 del juego, no nuestro autofire) → no sobre-disparar.
-                    if op == D.OP.SHOOT and not D._selfFiring then
-                        -- PELLET COUNT por arma: las escopetas (SPAS/DB) mandan N pellets por tiro. Lo aprendemos
-                        -- del op14 REAL del juego (dispará 1 vez con la escopeta) → el autofire replica N pellets.
-                        do
-                            local bl, wt = p[3], p[2]
-                            if type(bl) == "table" and #bl >= 1 and typeof(wt) == "Instance" then
-                                D.pelletsByWeapon = D.pelletsByWeapon or {}
-                                D.pelletsByWeapon[wt.Name] = #bl
-                            end
-                        end
-                        local now = os.clock()
-                        if D._lastRealShot then
-                            local dt = now - D._lastRealShot
-                            -- FLOOR 0.07s (era 0.02): un dt < 70ms NO es un firerate real — es un pellet-burst de
-                            -- escopeta (SPAS/DB manda N op14 juntos) o un doble-click. Aprenderlo envenenaba
-                            -- observedFirerate a 20-50/s → el autoshoot disparaba rapidísimo → unequip por el
-                            -- "1 disparo manual rompe todo". Rechazamos los gaps espurios.
-                            if dt > 0.07 and dt < 2 then D.observedFirerate = dt end
-                        end
-                        D._lastRealShot = now
-                    end
-                    -- DETECCIÓN de cargador + TIEMPO DE RELOAD del juego (op42 MagDrop → op40 OnReload):
-                    -- el delta = la duración real de la anim de recarga → la usamos para que nuestro auto-reload
-                    -- matchee (op40 muy temprano/tarde = server rechaza = munición no se rellena = balas rojas).
-                    if op == D.OP.MAGDROP and not D._selfReload then D._magDropT = os.clock() end
-                    if op == D.OP.RELOAD and not D._selfReload then
-                        local mag, wtool = p[3], p[2]
-                        if type(mag) == "number" and mag >= 2 and mag <= 200 and typeof(wtool) == "Instance" then
-                            D.magByWeapon = D.magByWeapon or {}
-                            D.magByWeapon[wtool.Name] = mag
-                        end
-                        if D._magDropT then
-                            local rt = os.clock() - D._magDropT
-                            if rt > 0.3 and rt < 6 then D.observedReloadTime = rt end
-                            D._magDropT = nil
-                        end
-                    end
-                    -- op14: SILENT AIM (redirige al target) + BULLET MULTIPLIER (padea el array a N pellets).
-                    -- Se aplica al op14 del JUEGO (mouse1) y al nuestro → N× daño por disparo LEGAL (mismo
-                    -- GST/firerate/timing del juego = sin rate-limit, sin unequip). Escopetas: suma pellets.
-                    if op == D.OP.SHOOT then
-                        local bullets = p[3]
-                        local mult = D.bulletMult or 1
-                        local swap = D.swapOn and D.cachedHitPart and D.cachedHitPos
-                        if type(bullets) == "table" and (swap or mult > 1) then
-                            -- 1) redirige los existentes al target (silent aim)
-                            if swap then
-                                for i = 1, #bullets do
-                                    local b = bullets[i]
-                                    if type(b) == "table" then
-                                        b[3] = D.cachedHitPos; b[4] = D.cachedHitPart; b[5] = D.cachedHitPos; b[6] = ZERO
-                                        if D.wallbang and D.cachedOrigin then b[1] = D.cachedOrigin; b[2] = D.cachedOrigin end
-                                    end
-                                end
-                            end
-                            -- 2) MULTIPLICADOR: clona el array hasta #bullets*mult (cada clon = bala nueva)
-                            local base = #bullets
-                            if mult > 1 and base > 0 then
-                                for k = 1, base * (mult - 1) do
-                                    local s = bullets[((k - 1) % base) + 1]
-                                    if type(s) == "table" then
-                                        bullets[base + k] = { s[1], s[2], s[3], s[4], s[5], s[6] }
-                                    end
-                                end
-                            end
-                            return orig(self, unpackf(p, 1, p.n))
-                        end
-                    -- MELEE AURA (op16): redirige el hitPart al target de melee cacheado
-                    elseif op == D.OP.MELEE and D.meleeOn and D.meleePart then
-                        p[4] = D.meleePart                   -- hitPart
-                        p[5] = ZERO                          -- objspace (centro)
-                        return orig(self, unpackf(p, 1, p.n))
-                    -- TURRET silent aim (op56, fase 2 = fire): swap el hit-table al target (mismo formato)
-                    elseif op == D.OP.TURRET and p[3] == 2 and D.swapOn and D.cachedHitPart and D.cachedHitPos then
-                        local hits = p[4]
-                        if type(hits) == "table" then
-                            for i = 1, #hits do
-                                local hh = hits[i]
-                                if type(hh) == "table" then
-                                    hh[3] = D.cachedHitPos; hh[4] = D.cachedHitPart; hh[5] = D.cachedHitPos; hh[6] = ZERO
-                                end
-                            end
-                            return orig(self, unpackf(p, 1, p.n))
-                        end
-                    end
+                local h = D and D._onNamecall
+                if h then
+                    local res = table.pack(h(self, orig, ...))
+                    if res[1] then return unpackf(res, 2, res.n) end -- manejó (swap) → devolvé su resultado
                 end
-                return orig(self, ...)                        -- passthrough transparente
+                return orig(self, ...)                               -- passthrough transparente
             end))
         end)
         if ok then
@@ -1813,31 +1812,34 @@ return function(require, LIP, Lib)
     local function nextGST() LIP._gstReal = os.clock(); return GST() end
     Weapon.nextGST = nextGST
 
-    -- DETECCIÓN DE CARGADOR POR ARMA: el Net hook captura `magammo` del op40 del reload REAL del juego
-    -- (arg2), keyed por nombre de arma → LIP.magByWeapon[name]. Se aprende al recargar 1 vez (R o auto
-    -- del juego). Fallback = slider Mag Size mientras no se detecte.
-    local function magSize()
-        local tool = firearm()
-        local name = tool and tool.Name
-        if name and LIP.magByWeapon and LIP.magByWeapon[name] then return LIP.magByWeapon[name] end
-        return math.floor(O("ReloadAmmo") or 15)
-    end
-    Weapon.magSize = magSize
-
-    -- lee la munición REAL del display del juego (PlayerGui.ScreenGui...itemInfo = "N / M" = actual/cargador).
-    -- Sirve para SINCRONIZAR serverShots al equipar (fix del mismatch mid-carga: cargar el cheat con cargador
-    -- parcial). Después Net toma el conteo — el display del juego queda stale con autofire directo, así que
-    -- SOLO se lee como estado inicial (no continuo, o pelearía con nuestro contador).
+    -- munición del display del juego (PlayerGui...itemInfo = "N / M" = actual/cargador). Cacheamos el label.
+    --   · DENOMINADOR (M) = cargador REAL (NO se corrompe en escopetas per-slug) → lo usa magSize().
+    --   · NUMERADOR (N) = munición del juego (se decrementa en fire manual/reload; STALE con autofire directo)
+    --     → solo para SYNC de serverShots al equipar (fix mismatch mid-carga).
+    local _ammoLbl
     local function gameAmmo()
-        local pg = LP:FindFirstChild("PlayerGui"); if not pg then return nil end
-        local lbl = pg:FindFirstChild("itemInfo", true)
-        if lbl and lbl:IsA("TextLabel") then
-            local n, m = tostring(lbl.Text):match("(%d+)%s*/%s*(%d+)")
+        if not (_ammoLbl and _ammoLbl.Parent) then
+            local pg = LP:FindFirstChild("PlayerGui")
+            _ammoLbl = (pg and pg:FindFirstChild("itemInfo", true)) or nil
+        end
+        if _ammoLbl and _ammoLbl:IsA("TextLabel") then
+            local n, m = tostring(_ammoLbl.Text):match("(%d+)%s*/%s*(%d+)")
             if n and m then return tonumber(n), tonumber(m) end
         end
         return nil
     end
     Weapon.gameAmmo = gameAmmo
+
+    -- CARGADOR: 1º el denominador del display del juego (M, siempre correcto, instantáneo) > magByWeapon
+    -- aprendido (max, fallback) > slider. El display arregla el bug "2/2 3/3" (magByWeapon per-slug corrupto).
+    local function magSize()
+        local _, m = gameAmmo()
+        if m and m >= 1 then return m end
+        local tool = firearm(); local name = tool and tool.Name
+        if name and LIP.magByWeapon and LIP.magByWeapon[name] then return LIP.magByWeapon[name] end
+        return math.floor(O("ReloadAmmo") or 15)
+    end
+    Weapon.magSize = magSize
 
     -- tiempo REAL de reload por arma: DB del calibrador (observa op45→op43 del reload del juego → reloadtime)
     -- > observedReloadTime (aprendido en vivo por Net del reload manual) > 2.0 fallback.
