@@ -3705,7 +3705,7 @@ return function(require, LIP, Lib)
         ihc:AddSlider("IdleDist", { Text = "radius", Min = 1, Max = 100, Default = 30, Suffix = "studs" })
 
         --== utility (right, weight 7) ==--
-        local util = rb:AddPanel("utility", { Column = 2, Weight = 7 })
+        local util = rb:AddPanel("utility", { Column = 2, Weight = 10 })
         local ft = util:AddToggle("TargetStrafe", { Text = "follow target", Default = false,
             Tooltip = "Desync: el server te ve orbitando; cuerpo/cámara reales quietos" })
         local ftc = ft:AddConfig()
@@ -3725,6 +3725,19 @@ return function(require, LIP, Lib)
         ftc:AddToggle("Spectate", { Text = "spectate target", Default = false })
         ftc:AddKeybind("SpectateKey", { Text = "spectate key", Mode = "Toggle",
             Callback = function(a) local t = Lib.Toggles.Spectate; if t then t:SetValue(a) end end })
+
+        -- melee / fists (fusionado desde la tab Legit → todo bajo engranaje, sin sliders sueltos)
+        local mel = util:AddToggle("MeleeAura", { Text = "melee aura", Default = false,
+            Tooltip = "op19 passive: al golpear con arma melee, redirige el hit al enemigo cercano" })
+        local melc = mel:AddConfig()
+        melc:AddSlider("MeleeRange", { Text = "range", Min = 4, Max = 30, Default = 12, Suffix = "studs" })
+        local pun = util:AddToggle("AutoPunch", { Text = "auto punch", Default = false,
+            Tooltip = "op36 activo (puños, sin GST): golpea al enemigo cercano en rango" })
+        local punc = pun:AddConfig()
+        punc:AddSlider("PunchRange", { Text = "range", Min = 4, Max = 30, Default = 8, Suffix = "studs" })
+        punc:AddToggle("RapidPunch", { Text = "rapid punch", Default = false,
+            Tooltip = "Modificador de auto punch: spamea op36 al rate del slider (sin GST), saltea la anim. Necesita auto punch ON. Rate alto = server puede gatear." })
+        punc:AddSlider("PunchRate", { Text = "rate", Min = 2, Max = 30, Default = 10, Suffix = "/s" })
 
         --== visualization (left, weight 3) ==--
         local viz = rb:AddPanel("visualization", { Column = 1, Weight = 3 })
@@ -3824,20 +3837,6 @@ return function(require, LIP, Lib)
         rdyn:AddSlider("AroundTime", { Text = "chase time", Min = 0.05, Max = 10, Default = 2, Decimals = 2, Suffix = "s" })
         rdyn:AddSlider("StrafeTime", { Text = "strafe time", Min = 0.05, Max = 10, Default = 2, Decimals = 2, Suffix = "s" })
         rdyn:AddSlider("VoidTime", { Text = "bait time", Min = 0.05, Max = 12, Default = 1, Decimals = 2, Suffix = "s" })
-
-        local Legit = Window:AddCategory("Legit", "target")
-        local LS = Legit:AddSection("Legit", "Melee · Fists", { Columns = 2 })
-        local l1 = LS:AddPanel("Melee", { Column = 1 })
-        l1:AddToggle("MeleeAura", { Text = "Melee Aura", Default = false,
-            Tooltip = "op16 passive: al golpear con arma melee, redirige el hit al enemigo cercano" })
-        l1:AddSlider("MeleeRange", { Text = "Melee Range", Min = 4, Max = 30, Default = 12, Suffix = "studs" })
-        local l2 = LS:AddPanel("Fists", { Column = 2 })
-        l2:AddToggle("AutoPunch", { Text = "Auto Punch", Default = false,
-            Tooltip = "op33 activo (puños, sin GST): golpea al enemigo cercano en rango" })
-        l2:AddSlider("PunchRange", { Text = "Punch Range", Min = 4, Max = 30, Default = 8, Suffix = "studs" })
-        l2:AddToggle("RapidPunch", { Text = "Rapid Punch", Default = false,
-            Tooltip = "Modificador de Auto Punch: spamea op36 (sin GST) al rate del slider, salteando la animación del puño. Necesita Auto Punch ON. Rate muy alto = el server puede ignorar/gatear." })
-        l2:AddSlider("PunchRate", { Text = "Punch Rate", Min = 2, Max = 30, Default = 10, Suffix = "/s" })
 
         --========================= MISC =========================--
         local Misc = Window:AddCategory("Misc", "wrench")
@@ -3974,6 +3973,9 @@ return function(require, LIP, Lib)
             :AddColorPicker("HitMarkColor", { Default = Color3.fromRGB(255, 255, 255) })
         hf2:AddSlider("HitMarkSize", { Text = "Size", Min = 2, Max = 20, Default = 7 })
         hf2:AddSlider("HitMarkGap", { Text = "Gap", Min = 0, Max = 15, Default = 4 })
+
+        -- config tab nativo de juju (save/load/update/delete/autoload) — último grupo del sidebar
+        if Lib.SetupConfigs then Lib:SetupConfigs("configs") end
     end
 
     return UI
@@ -14452,6 +14454,13 @@ return function(J, W)
         end
       end
     end
+    -- config tab (juju native): setup_configs(name) crea el grupo "name" con save/load/autoload.
+    -- DESPUÉS de construir todos los grupos → aparece último en el sidebar. Los flags ya están
+    -- registrados; save los serializa, load dispara set_toggle/set_slider/... (→ on_*_change → wire
+    -- sincroniza cada handle.Value). Sin re-sync extra.
+    if Lib.__pendingConfigs and J.menu and J.menu.setup_configs then
+      pcall(function() J.menu:setup_configs(Lib.__pendingConfigs) end)
+    end
     if Lib.__pendingAutoload and Lib.__doAutoload then Lib.__doAutoload() end
   end
 
@@ -14488,6 +14497,17 @@ return function(J, W)
   end
   function Lib:LoadAutoloadConfig()
     if Lib.__materialized then Lib.__doAutoload() else Lib.__pendingAutoload = true end
+  end
+
+  -- config tab: la app pide el tab de configs nativo de juju. Si ya se materializó, lo crea ya;
+  -- si no, se difiere y __materialize lo crea al final (tras construir los grupos de features).
+  function Lib:SetupConfigs(name)
+    name = name or "configs"
+    if Lib.__materialized then
+      if M and M.setup_configs then pcall(function() M:setup_configs(name) end) end
+    else
+      Lib.__pendingConfigs = name
+    end
   end
 
   -- juju exposes no full menu teardown (only section:destroy). Best-effort: drop juju's
