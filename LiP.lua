@@ -55,6 +55,8 @@ return function(require, _unused, Lib)
     -- └─ (2026-08-27, RE-VERIFICADO línea-por-línea contra BClientV53_decompiled.txt reg. L117-263, PlaceVersion=53)
     LIP.OP = {
         TEAM    = 1,    -- JoinTeam(TeamInstance)                              [v48 1]
+        REPORT     = 9,  -- Report(player)  RemoteEvent — reporte manual entre jugadores
+        REPORTLIST = 10, -- ReportList()    RemoteFunction → lista {Player, Score} (cheat-score del AC, incluido el propio)
         GRAB    = 14,   -- ReceiveTool(toolModel)                             [v48 12]
         SHOOT   = 17,   -- FirearmBullets(Tool, bullets, GST)                 [v48 14]
         MELEE   = 19,   -- OnMeleeRemote(Tool, GST, hitPart, objspace)        [v48 16]
@@ -4009,6 +4011,91 @@ return function(require, LIP, Lib)
 end
 
 end)()
+_MODS["Visuals.ScoreHUD"] = (function()
+-- Visuals/ScoreHUD.lua — FACTORY. HUD del CHEAT-SCORE propio del AC.
+-- El juego mantiene un score de sospecha por jugador (AC acumulativo, server-side) y lo EXPONE al cliente:
+-- la pestaña `CheatReport` pollea `ReportList:InvokeServer()` (opcode 10, RemoteFunction) cada 2s → devuelve
+-- lista `{Player, Score}` de TODOS (incluido vos). Nosotros llamamos el mismo raw `RemoteFunction:InvokeServer(10)`,
+-- buscamos al LocalPlayer y mostramos su Score en un HUD → por fin VES cuánto acumulaste hacia el kick nc/rps.
+-- 100% lectura (InvokeServer normal, sin forjar nada) + rate = el del juego (0.5/s). Drawing-only (0 instancias).
+return function(require, LIP, Lib)
+    local Players    = game:GetService("Players")
+    local RunService = game:GetService("RunService")
+    local Workspace  = game:GetService("Workspace")
+    local LP = Players.LocalPlayer
+    local ScoreHUD = {}
+    local function T(f) local t = Lib.Toggles[f]; return t and t.Value end
+    local function O(f) local o = Lib.Options[f];  return o and o.Value end
+
+    local RF               -- cache del RemoteFunction multiplexado
+    local lbl              -- Drawing Text
+    local lastPoll = 0
+    local lastScore, lastSeenT = nil, 0
+
+    local function ensureLbl()
+        if not lbl then
+            lbl = Drawing.new("Text")
+            lbl.Size = 19; lbl.Center = true; lbl.Outline = true; lbl.Font = 2
+        end
+        return lbl
+    end
+    local function hide() if lbl then lbl.Visible = false end end
+
+    -- lee la lista de scores y extrae el nuestro. Corre en su propio thread (InvokeServer YIELDS → no en render).
+    local function pollScore()
+        RF = RF or (LIP.Events and LIP.Events:FindFirstChild("RemoteFunction"))
+        if not RF then return end
+        local ok, list = pcall(function() return RF:InvokeServer(LIP.OP.REPORTLIST) end)
+        if not ok or type(list) ~= "table" then return end
+        local mine
+        for _, e in pairs(list) do
+            if type(e) == "table" and e.Player == LP and type(e.Score) == "number" then mine = e.Score; break end
+        end
+        -- si no aparecemos en la lista, el server no nos reporta score (≈ bajo el mínimo) → 0
+        lastScore = mine or 0
+        lastSeenT = os.clock()
+    end
+
+    function ScoreHUD.tick()
+        if not T("ScoreHUD") then hide(); return end
+        local now = os.clock()
+        -- poll 1s (más fino que los 2s del juego para ver spikes; sigue siendo lectura barata). Un burst muy
+        -- rápido (78→243) igual puede cruzar entre polls → no spamear grab/desync en ráfaga.
+        if now - lastPoll >= 1 then
+            lastPoll = now
+            task.spawn(pollScore)
+        end
+        if lastScore == nil then
+            -- todavía sin primer dato → placeholder
+            local L = ensureLbl(); local vp = Workspace.CurrentCamera.ViewportSize
+            L.Color = Color3.fromRGB(150, 150, 150); L.Text = "AC SCORE: ..."
+            L.Position = Vector2.new(vp.X * 0.5, (O("ScoreHUDY") or 84))
+            L.Visible = true
+            return
+        end
+        local L = ensureLbl()
+        local vp = Workspace.CurrentCamera.ViewportSize
+        -- color por nivel: verde bajo → amarillo → rojo alto. Umbral REAL desconocido (server-side); escala
+        -- tentativa /100 hasta calibrar con el score al que kickee. Ajustable con ScoreHUDScale.
+        local scale = O("ScoreHUDScale"); scale = (scale and scale > 1) and scale or 100
+        local frac = math.clamp(lastScore / scale, 0, 1)
+        local r = math.floor(255 * math.min(1, frac * 2))
+        local g = math.floor(255 * math.min(1, (1 - frac) * 2))
+        L.Color = Color3.fromRGB(r, g, 40)
+        L.Text = ("AC SCORE: %.1f"):format(lastScore)
+        L.Position = Vector2.new(vp.X * 0.5, (O("ScoreHUDY") or 84))
+        L.Visible = true
+    end
+
+    function ScoreHUD.init()
+        LIP.onCleanup(function() if lbl then pcall(function() lbl:Remove() end) end; lbl = nil end)
+        LIP.track(RunService.RenderStepped:Connect(function() pcall(ScoreHUD.tick) end))
+    end
+
+    return ScoreHUD
+end
+
+end)()
 _MODS["UI"] = (function()
 -- UI.lua — FACTORY. Categorías Rage / Legit / Misc / Visuals. Paneles separados por función.
 -- Flags en Lib.Toggles / Lib.Options.
@@ -4192,6 +4279,13 @@ return function(require, LIP, Lib)
         chc:AddSlider("CrossHUDFadeSpeed", { Text = "wave speed", Min = 1, Max = 20, Default = 6, Decimals = 1 })
         chc:AddSlider("CrossHUDSize", { Text = "text size", Min = 10, Max = 28, Default = 16 })
         chc:AddSlider("CrossHUDOffset", { Text = "y offset", Min = 10, Max = 120, Default = 34, Suffix = "px" })
+
+        local sch = viz:AddToggle("ScoreHUD", { Text = "ac score hud", Default = false,
+            Tooltip = "Lee tu CHEAT-SCORE propio del AC vía ReportList (op10, RemoteFunction, lo mismo que la pestaña CheatReport del juego) y lo muestra en pantalla. Score alto = cerca del kick nc/rps. 100% lectura, pollea cada 2s (rate del juego)." })
+        local schc = sch:AddConfig()
+        schc:AddSlider("ScoreHUDY", { Text = "y position", Min = 40, Max = 400, Default = 84, Suffix = "px" })
+        schc:AddSlider("ScoreHUDScale", { Text = "red at (calibrar)", Min = 10, Max = 500, Default = 100,
+            Tooltip = "Score al que el HUD llega a rojo. Ajustá al score REAL del kick cuando lo sepas." })
 
         local vzh = viz:AddToggle("VoidViz", { Text = "indicator", Default = true,
             Tooltip = "Ghost/skeleton + tracer en la pos que ve el server" })
@@ -4464,6 +4558,7 @@ return function(require, LIP, Lib)
     local HitFX   = require("Visuals.HitEffects")
     local CrossHUD = require("Visuals.CrosshairHUD")
     local AmmoHUD = require("Visuals.AmmoHUD")
+    local ScoreHUD = require("Visuals.ScoreHUD")
     local UI      = require("UI")
 
     local Window = Lib:CreateWindow({ Title = "life in prison", Size = Vector2.new(834, 586) })
@@ -4492,6 +4587,7 @@ return function(require, LIP, Lib)
     PropAura.init()  -- aura server-side: N props sueltos owneados orbitando
     HitFX.init()     -- hitsounds / killsounds / hitmarker (op46)
     CrossHUD.init()  -- labels de estado del ragebot abajo del crosshair
+    ScoreHUD.init()  -- HUD del cheat-score propio (ReportList op10)
 
     -- KEEP-ALIVE (método canónico "bob", ref [[position-keepalive]]): el cliente solo replica la CFrame del
     -- char cuando CAMBIA → idle sin delta = server-pos congelada. En vez de FORZAR NetworkIsSleeping=false
