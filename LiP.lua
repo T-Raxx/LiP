@@ -36,6 +36,7 @@ return function(require, _unused, Lib)
 
     local LIP = {
         enabled   = false,           -- master del engine
+        acDebug   = false,           -- diagnóstico AC (reportes op69-72 + kill + rps). Flip por consola: getgenv().LIP.acDebug=true
         swapOn    = false,           -- silent aim arg-swap activo
         target    = nil,             -- Player resuelto
         conns     = {},              -- RBXScriptConnections trackeadas
@@ -49,8 +50,9 @@ return function(require, _unused, Lib)
     -- │  El OP = índice `count` de la tabla de remotes del cliente (re-decompilado del BClient).
     -- │  BUMP DE VERSIÓN DEL JUEGO = re-decompilar BClient y actualizar SOLO esta tabla.
     -- │  Historial: v48→v50 la lista de remotes creció → grab +2, todo lo demás +3 desde shoot.
-    -- │  v50→v51: tabla netevgen IDÉNTICA (0 remotes agregados/reordenados) → TODOS los opcodes intactos.
-    -- └─ (2026-08-25, RE-VERIFICADO línea-por-línea contra BClientV51.txt reg. 14831-14977, PlaceVersion=51)
+    -- │  v50→v51→v53: tabla netevgen IDÉNTICA (0 remotes agregados/reordenados) → TODOS los opcodes intactos.
+    -- │  v53 AC client-side = clon exacto de v51 (watchers/enum/f72 kill iguales; 0 primitivos anti-hook).
+    -- └─ (2026-08-27, RE-VERIFICADO línea-por-línea contra BClientV53_decompiled.txt reg. L117-263, PlaceVersion=53)
     LIP.OP = {
         TEAM    = 1,    -- JoinTeam(TeamInstance)                              [v48 1]
         GRAB    = 14,   -- ReceiveTool(toolModel)                             [v48 12]
@@ -99,6 +101,20 @@ return function(require, _unused, Lib)
     function LIP.track(c) LIP.conns[#LIP.conns + 1] = c ; return c end
     function LIP.onCleanup(fn) LIP.cleanups[#LIP.cleanups + 1] = fn ; return fn end
 
+    -- STEALTH (OTH/Potassium): oculta `fn` de detecciones por CALL-STACK (`debug.info(2,"f")` del AC v51 en
+    -- BClient L8207 = único primitivo anti-hook presente). Aplicar a los closures de nuestros hooks
+    -- (__namecall/__index). Feature-detected + pcall: no-op en executors sin `setstackhidden`. Firma probada
+    -- 2-arg y 1-arg (varía por executor). Devuelve `fn` para encadenar. NOTA: `oth.hook` NO se usa para los
+    -- metamétodos — corre off-thread en hilos aislados → no puede devolver args modificados sincrónicamente
+    -- (rompería el silent-aim arg-swap); es para hooks de funciones C fire-and-forget.
+    function LIP.hideStack(fn)
+        if type(setstackhidden) == "function" then
+            pcall(setstackhidden, fn, true)
+            pcall(setstackhidden, fn)
+        end
+        return fn
+    end
+
     function LIP.Unload()
         LIP.enabled, LIP.swapOn = false, false
         for _, fn in ipairs(LIP.cleanups) do pcall(fn) end   -- destruir instancias (fly BV, etc.)
@@ -133,6 +149,7 @@ return function(require, LIP, Lib)
     local unpackf = table.unpack or unpack
     local ZERO    = Vector3.zero
     local LP      = game:GetService("Players").LocalPlayer
+    local checkcaller = checkcaller
 
     -- DISABLERS (experimentales): señal MUERTA p/ neutralizar GetPropertyChangedSignal del AC + set de props.
     local DEAD_CONN   = { Disconnect = function() end, disconnect = function() end, Connected = false }
@@ -149,6 +166,7 @@ return function(require, LIP, Lib)
 
     function Net.install()
         LIP.RE = LIP.RE or (LIP.Events and LIP.Events:FindFirstChild("RemoteEvent"))
+        if LIP.acDebug then warn("[LIP-AC] BUILD DIAGNÓSTICO cargado — logueo reportes AC (op69-72) + intercepciones de kill. Si te kickean SIN un log [LIP-AC] previo = server-side puro (rps/noclip).") end
 
         -- ── LÓGICA (redefinida cada carga → el shell persistente la toma sin rejoin) ──────────────
         -- Recibe `orig` (el namecall real) para poder re-firar con args modificados (silent aim/multiplier/
@@ -165,11 +183,45 @@ return function(require, LIP, Lib)
                     if MOVE_PROPS[(...)] then return true, DEAD_SIGNAL end
                 end
             end
+            -- BLOCK AC KILL: f72 hace `char:BreakJoints()` + `Neck:Destroy()` en el kill (junto al Health=0 que
+            -- tapa el __newindex). Tragamos esos namecalls del JUEGO sobre NUESTRO char (checkcaller=nuestros pasan).
+            if D.blockACKill and (not checkcaller or not checkcaller()) then
+                local ch = LP.Character
+                if method == "BreakJoints" and self == ch then
+                    if D.acDebug then warn("[LIP-AC] blocked BreakJoints() (kill sequence)") end
+                    return true
+                end
+                if method == "Destroy" and typeof(self) == "Instance" and self.Name == "Neck"
+                   and ch and self:IsDescendantOf(ch) then
+                    if D.acDebug then warn("[LIP-AC] blocked Neck:Destroy() (kill sequence)") end
+                    return true
+                end
+            end
             if not (self == D.RE and method == "FireServer") then return false end
             local p = table.pack(...)
             local op = p[1]
+            -- DIAGNÓSTICO rps: contar FireServer/s (total + op17) en el remote multiplexado → ver NUESTRO rate
+            -- REAL de requests al server (el AntiCheat kickea por "rps"). Loguea al rodar cada segundo.
+            if D.acDebug then
+                local b = D._rpsBucket; if not b then b = { t = 0, total = 0, shoot = 0 }; D._rpsBucket = b end
+                local sec = math.floor(os.clock())
+                if sec ~= b.t then
+                    if b.total > 0 then warn(("[LIP-AC] rps=%d req/s (op17=%d)"):format(b.total, b.shoot)) end
+                    b.t, b.total, b.shoot = sec, 0, 0
+                end
+                b.total = b.total + 1
+                if op == D.OP.SHOOT then b.shoot = b.shoot + 1 end
+            end
+            -- DIAGNÓSTICO: loguear TODO reporte AC (op69-72) ANTES de decidir el drop → aparece SIEMPRE que el
+            -- cliente detecta algo, sin importar los toggles. Si hay kick y NO hubo este log = server-side puro.
+            if D.acDebug and (op == D.OP.ACTRIGGER or op == D.OP.ACKICK or op == D.OP.ACCFRAME or op == D.OP.ACF) then
+                local kind = (op == D.OP.ACKICK and "KICK") or (op == D.OP.ACTRIGGER and "TRIGGER")
+                    or (op == D.OP.ACCFRAME and "CFRAME") or "ACF"
+                warn(("[LIP-AC] %s op=%s code=%s extra=%s (drop=%s)"):format(
+                    kind, tostring(op), tostring(p[2]), tostring(p[3]), tostring(D.disableACReports == true)))
+            end
             -- DISABLER reportes AC: dropear ACTrigger/ACCFrameChanged/ACKickTrigger/ACF (cliente→server) → el
-            -- server no recibe la detección (no llamamos orig). ⚠ opcodes v50 (verificar en v51).
+            -- server no recibe la detección (no llamamos orig). opcodes v53 verificados.
             if D.disableACReports and (op == D.OP.ACTRIGGER or op == D.OP.ACKICK or op == D.OP.ACCFRAME or op == D.OP.ACF) then
                 return true
             end
@@ -227,26 +279,17 @@ return function(require, LIP, Lib)
                 local bullets = p[3]
                 local mult = D.bulletMult or 1
                 local swap = D.swapOn and D.cachedHitPart and D.cachedHitPos
-                -- FORCE SPOOF ORIGIN (toggle, opt-in): con pos-spoof/weld activo, el origen[1]+muzzle[2] de CADA
-                -- bala = spoofFakePos (donde el server te ve) → el tracer replica desde el cuerpo VISIBLE
-                -- spoofeado, NO desde el real (fix reveal + consistencia origin↔hit). Cubre auto (buildBullet ya
-                -- pone origen fake pero muzzle real) Y manual (el juego pone ambos reales). Wallbang tiene prioridad.
-                local fso = D.forceSpoofOrigin and (D.spoofOn or D.connRep) and D.spoofFakePos
-                local fakeO = fso and (D.spoofFakePos + Vector3.new(0, D.spoofOriginHeight or 1.5, 0)) or nil
-                if type(bullets) == "table" and (swap or mult > 1 or fso) then
+                -- El origen/muzzle REAL del juego pasan sin tocar (Spoofed Shot Origin removido: forzarlos a
+                -- spoofFakePos daba anomalía origen↔hit que el server valida). Solo swapeamos el HIT (silent aim);
+                -- el origen solo se toca en WALLBANG (LOS garantizada desde el lado del target de la pared).
+                if type(bullets) == "table" and (swap or mult > 1) then
                     if swap then
                         for i = 1, #bullets do
                             local b = bullets[i]
                             if type(b) == "table" then
                                 b[3] = D.cachedHitPos; b[4] = D.cachedHitPart; b[5] = D.cachedHitPos; b[6] = ZERO
-                                if D.wallbang and D.cachedOrigin then b[1] = D.cachedOrigin; b[2] = D.cachedOrigin
-                                elseif fso then b[1] = fakeO; b[2] = fakeO end
+                                if D.wallbang and D.cachedOrigin then b[1] = D.cachedOrigin; b[2] = D.cachedOrigin end
                             end
-                        end
-                    elseif fso then                                  -- manual/sin-target: solo redirige el origen
-                        for i = 1, #bullets do
-                            local b = bullets[i]
-                            if type(b) == "table" then b[1] = fakeO; b[2] = fakeO end
                         end
                     end
                     local base = #bullets
@@ -280,7 +323,9 @@ return function(require, LIP, Lib)
         if getgenv().__LIP_HOOK then return end
         local orig
         local ok = pcall(function()
-            orig = hookmm(game, "__namecall", newcc(function(self, ...)
+            -- STEALTH: el closure del shell se OCULTA del call-stack (setstackhidden vía LIP.hideStack) →
+            -- el `debug.info(2,"f")` del AC no ve nuestro hook en la pila. _onNamecall también.
+            local shell = newcc(function(self, ...)
                 local D = getgenv().LIP
                 local h = D and D._onNamecall
                 if h then
@@ -288,7 +333,9 @@ return function(require, LIP, Lib)
                     if res[1] then return unpackf(res, 2, res.n) end -- manejó (swap) → devolvé su resultado
                 end
                 return orig(self, ...)                               -- passthrough transparente
-            end))
+            end)
+            if LIP.hideStack then LIP.hideStack(shell); LIP.hideStack(LIP._onNamecall) end
+            orig = hookmm(game, "__namecall", shell)
         end)
         if ok then
             getgenv().__LIP_HOOK = true
@@ -876,14 +923,17 @@ return function(require, LIP, Lib)
         if getgenv().__LIP_IDX then return end
         local orig
         local ok = pcall(function()
-            orig = hookmm(game, "__index", newcc(function(self, key)
+            -- STEALTH: closure del __index oculto del call-stack (setstackhidden) → invisible a debug.info del AC.
+            local idx = newcc(function(self, key)
                 local D = getgenv().LIP
                 if D and D.spoofOn and self == D.cachedRoot and D.spoofRealCF then
                     if key == "CFrame" then return D.spoofRealCF end
                     if key == "Position" then return D.spoofRealCF.Position end
                 end
                 return orig(self, key)
-            end))
+            end)
+            if LIP.hideStack then LIP.hideStack(idx) end
+            orig = hookmm(game, "__index", idx)
         end)
         if ok then getgenv().__LIP_IDX = true; getgenv().__LIP_ORIG_INDEX = orig end
     end
@@ -1682,6 +1732,13 @@ return function(require, LIP, Lib)
     local LP = Players.LocalPlayer
     local Target = {}
 
+    -- mouse en espacio VIEWPORT (mismo que WorldToViewportPoint/ViewportPointToRay: inset ya descontado).
+    local _mouse
+    local function mousePos()
+        _mouse = _mouse or LP:GetMouse()
+        return Vector2.new(_mouse.X, _mouse.Y)
+    end
+
     local function alive(char)
         local h = char and char:FindFirstChildOfClass("Humanoid")
         return (h and h.Health > 0) or false, h
@@ -1713,11 +1770,52 @@ return function(require, LIP, Lib)
     end
     Target.hasFF = hasFF
 
+    -- RAYCAST desde la cámara a través del MOUSE: si pega directo al char de un enemigo vivo, ese es el target
+    -- (máxima prioridad = "apuntar a lo que está bajo el cursor"). Silent aim = el hit se swapea server-side,
+    -- así que sirve aunque el target esté offscreen/detrás de pared (no hay FOV ni LOS gate en este modo).
+    local function mouseRayTarget(opts)
+        local cam = Workspace.CurrentCamera
+        local mp = mousePos()
+        local ray = cam:ViewportPointToRay(mp.X, mp.Y)
+        local rp = RaycastParams.new()
+        rp.FilterType = Enum.RaycastFilterType.Exclude
+        rp.FilterDescendantsInstances = { LP.Character }
+        rp.IgnoreWater = true
+        local res = Workspace:Raycast(ray.Origin, ray.Direction * 5000, rp)
+        if res and res.Instance then
+            local model = res.Instance:FindFirstAncestorOfClass("Model")
+            local plr = model and Players:GetPlayerFromCharacter(model)
+            if plr and isEnemy(plr, opts) and select(1, alive(model)) then return plr end
+        end
+        return nil
+    end
+
     -- silent aim: elige el mejor target según modo. Setea LIP.target.
     function Target.pick(opts)
         local cam = Workspace.CurrentCamera
         local myHRP = LP.Character and LP.Character:FindFirstChild("HumanoidRootPart")
         local mode = opts.mode or "Crosshair"
+        -- MODO MouseClosest (toggle extra "silent mouse"): 1° raycast bajo el cursor; si no, el enemigo cuyo
+        -- HRP proyecta MÁS CERCA del mouse en pantalla. SIN FOV, offscreen PERMITIDO (penalizado, no excluido →
+        -- onscreen-cerca-del-mouse gana, pero si no hay ninguno onscreen igual lockea al offscreen).
+        if mode == "MouseClosest" then
+            local hit = mouseRayTarget(opts)
+            if hit then LIP.target = hit; return hit end
+            local mp = mousePos()
+            local best, bestScore = nil, math.huge
+            for _, plr in ipairs(Players:GetPlayers()) do
+                local char = plr.Character
+                local hrp = char and char:FindFirstChild("HumanoidRootPart")
+                if hrp and select(1, alive(char)) and isEnemy(plr, opts) then
+                    local sp, on = cam:WorldToViewportPoint(hrp.Position)
+                    local d = (Vector2.new(sp.X, sp.Y) - mp).Magnitude
+                    if not on or sp.Z <= 0 then d = d + 1e5 end   -- offscreen: pickable pero detrás de onscreen
+                    if d < bestScore then best, bestScore = plr, d end
+                end
+            end
+            LIP.target = best
+            return best
+        end
         local best, bestScore = nil, math.huge
         for _, plr in ipairs(Players:GetPlayers()) do
             local char = plr.Character
@@ -2093,10 +2191,16 @@ return function(require, LIP, Lib)
         local margin = O("FireMargin"); margin = (margin and margin > 0.05) and margin or 0.914
         local jitter = O("FireJitter") or 0.05
         local iv = (fr / margin) / math.max(m, 0.02) * (1 + (math.random() * 2 - 1) * jitter)
-        if now - (LIP._lastAutoFire or 0) >= iv then
+        -- WATCHDOG: si mb1 quedó abajo >0.08s (task.delay muerto/starved) → soltar → no stallea el autofire.
+        if LIP._mb1Held and (now - (LIP._mb1DownT or 0)) > 0.08 then mb1(false); LIP._mb1Held = false end
+        -- GUARD anti-overlap `not _mb1Held`: NUNCA mandar un 2º mouse-down antes de soltar el anterior. El juego
+        -- (input controller L7638) warnea "ms1 not released" y DROPEA ese Begin → tiro perdido. Pasa en armas
+        -- rápidas (Minigun fr≈0.031 < release viejo 0.035). Release ADAPTATIVO (< iv) → suelta antes del próximo down.
+        if now - (LIP._lastAutoFire or 0) >= iv and not LIP._mb1Held then
             LIP._lastAutoFire = now
-            mb1(true); LIP._mb1Held = true
-            task.delay(0.035, function() mb1(false); LIP._mb1Held = false end)
+            LIP._mb1Held = true; LIP._mb1DownT = now
+            mb1(true)
+            task.delay(math.min(0.03, iv * 0.5), function() mb1(false); LIP._mb1Held = false end)
         end
     end
 
@@ -2285,9 +2389,94 @@ return function(require, LIP, Lib)
         jhApplied = applyBuff(2, wantJH, function() return jhApplied end)
     end
 
+    ------------------------------------------------------------------ AC DISABLER (getconnections)
+    -- Método VapeV4 (ref Prison Life Disabler): hookear GetPropertyChangedSignal solo afecta conexiones
+    -- FUTURAS; el AC YA conectó sus watchers al spawn del char. `getconnections(sig)` devuelve las conexiones
+    -- EXISTENTES → `:Disable()` mata el watcher del AC (deja de reportar). Guardamos p/ `:Enable()` al apagar,
+    -- re-aplicamos en respawn. ⚠ SOLO client-side: un check puramente server-side (overlap de posición) NO se
+    -- apaga así. LiP v51 (decompile): watchers de prop que REPORTAN = WalkSpeed(L7948)/JumpHeight(L7961); NO
+    -- tocamos CFrame (su changed-signal balancea el contador v8/v11 → disablearlo auto-castiga sus writes legit).
+    local getconns = getconnections
+    local disabledConns = {}
+    local function reenableAC()
+        for _, c in ipairs(disabledConns) do pcall(function() c:Enable() end) end
+        disabledConns = {}
+    end
+    local function disableSig(part, prop)
+        if not (getconns and part) then return end
+        pcall(function()
+            for _, c in ipairs(getconns(part:GetPropertyChangedSignal(prop))) do
+                pcall(function() c:Disable() end)
+                disabledConns[#disabledConns + 1] = c
+            end
+        end)
+    end
+    local function applyACDisable()
+        local c = char(); if not c then return end
+        local h = c:FindFirstChildOfClass("Humanoid")
+        if h then disableSig(h, "WalkSpeed"); disableSig(h, "JumpHeight"); disableSig(h, "JumpPower") end
+        -- CanCollide watcher (si existiera / p/ noclip CanCollide-based): partes principales del char
+        for _, name in ipairs({ "Head", "Torso", "HumanoidRootPart", "UpperTorso", "LowerTorso" }) do
+            local p = c:FindFirstChild(name); if p then disableSig(p, "CanCollide") end
+        end
+    end
+    local acApplied = false
+    local function tickACDisable()
+        local want = T("DisableMoveChecks") == true
+        if want and not acApplied then applyACDisable(); acApplied = true
+        elseif not want and acApplied then reenableAC(); acApplied = false end
+    end
+
+    -- TÉCNICA 2 (ref usuario, funcionó en Prison Life): hook `__newindex` que BLOQUEA que el JUEGO/AC re-active
+    -- CanCollide en las partes del char. `not checkcaller()` = el write viene del juego (los NUESTROS, desde el
+    -- executor, tienen checkcaller()=true → pasan). Mantiene un noclip CanCollide-based sin que el juego lo
+    -- revierta + puede tapar un watcher de write server-reported. Gated por DisableMoveChecks (lee LIP dinámico
+    -- → reload-safe). Guard __LIP_NEWINDEX (1 sola instalación, metamétodo distinto a __namecall/__index). ⚠
+    -- __newindex intercepta TODOS los writes de props → filtro rápido (prop=="CanCollide" primero). Feature-det.
+    local hookmm = hookmetamethod
+    local newcc  = newcclosure or function(f) return f end
+    local BLOCK_PARTS = { Head = true, Torso = true, HumanoidRootPart = true, UpperTorso = true, LowerTorso = true }
+    local function installCanCollideBlock()
+        if getgenv().__LIP_NEWINDEX then return end
+        if not (hookmm and checkcaller) then return end
+        local oldNI
+        local ok = pcall(function()
+            local shell = newcc(function(self, prop, value)
+                if prop == "CanCollide" then
+                    local D = getgenv().LIP
+                    if D and D.disableMoveChecks and not checkcaller() then
+                        local c = LP.Character
+                        if c and typeof(self) == "Instance" and self.Parent == c and BLOCK_PARTS[self.Name] then
+                            return   -- traga el write del juego (no revierte tu CanCollide)
+                        end
+                    end
+                elseif prop == "Health" then
+                    -- BLOCK AC KILL: f72 hace `Humanoid.Health = 0` 0.5s tras CUALQUIER detección → tragamos
+                    -- los writes de Health ≤ 0 del JUEGO a NUESTRO Humanoid (los nuestros pasan por checkcaller).
+                    -- Anti-muerte (sobrevivís el kill del AC; disableACReports ya evita el ban/kick).
+                    local D = getgenv().LIP
+                    if D and D.blockACKill and type(value) == "number" and value <= 0 and not checkcaller() then
+                        local c = LP.Character
+                        local h = c and c:FindFirstChildOfClass("Humanoid")
+                        if self == h then
+                            if D.acDebug then warn("[LIP-AC] blocked Humanoid.Health="..tostring(value).." write (kill sequence)") end
+                            return
+                        end
+                    end
+                end
+                return oldNI(self, prop, value)
+            end)
+            if LIP.hideStack then LIP.hideStack(shell) end   -- stealth OTH: oculta del call-stack
+            oldNI = hookmm(game, "__newindex", shell)
+        end)
+        if ok then getgenv().__LIP_NEWINDEX = true; getgenv().__LIP_ORIG_NEWINDEX = oldNI end
+    end
+
     ------------------------------------------------------------------ INIT
     function Move.init()
         LIP.onCleanup(stopFly)
+        LIP.onCleanup(reenableAC)   -- restaurar watchers del AC al Unload
+        installCanCollideBlock()    -- hook __newindex (block CanCollide re-enable del juego, gated)
 
         LIP.track(RunService.RenderStepped:Connect(function(dt)
             if T("Fly") then
@@ -2301,6 +2490,7 @@ return function(require, LIP, Lib)
 
         LIP.track(RunService.Heartbeat:Connect(function()
             updateSpeed()
+            tickACDisable()   -- disabler getconnections (edge on/off)
         end))
 
         LIP.track(UIS.JumpRequest:Connect(function()
@@ -3847,8 +4037,11 @@ return function(require, LIP, Lib)
 
         --== general (left, weight 7) ==--
         local gen = rb:AddPanel("general", { Column = 1, Weight = 7 })
-        gen:AddToggle("SilentAim", { Text = "ragebot", Default = false,
+        local sa = gen:AddToggle("SilentAim", { Text = "ragebot", Default = false,
             Tooltip = "op14 passive arg-swap al target. Cámara no se toca, GST intacto." })
+        local sac = sa:AddConfig()
+        sac:AddToggle("SilentMouse", { Text = "closest to mouse (no FOV)", Default = false,
+            Tooltip = "Override de selección: raycast bajo el cursor → si no, el enemigo que proyecta MÁS CERCA del mouse. SIN FOV, SIN wallcheck, offscreen/tras-pared OK (el swap es server-side). Ignora el 'target selection' de abajo mientras esté ON." })
 
         local af = gen:AddToggle("AutoFire", { Text = "auto fire", Default = false,
             Tooltip = "Dispara al target auto (sin click). SOLO con follow target ON. Capeado al firerate." })
@@ -3986,12 +4179,8 @@ return function(require, LIP, Lib)
             Tooltip = "Modificador de auto punch: spamea op36 al rate del slider (sin GST), saltea la anim. Necesita auto punch ON. Rate alto = server puede gatear." })
         punc:AddSlider("PunchRate", { Text = "rate", Min = 2, Max = 30, Default = 10, Suffix = "/s" })
 
-        -- FIX origen del disparo (opt-in, default OFF): fuerza origen+muzzle de cada bala = spoofFakePos.
-        local fso = util:AddToggle("ForceSpoofOrigin", { Text = "spoofed shot origin", Default = false,
-            Tooltip = "Fuerza el origen Y muzzle de cada bala = spoofFakePos (donde el server te ve) → los tracers salen del cuerpo VISIBLE spoofeado, no del real (fix reveal en desync/weld). Cubre disparos auto Y manuales. Wallbang tiene prioridad. Solo con pos-spoof/weld activo." })
-        local fsoc = fso:AddConfig()
-        fsoc:AddSlider("SpoofOriginHeight", { Text = "origin height", Min = -2, Max = 5, Default = 1.5, Decimals = 1, Suffix = "studs",
-            Tooltip = "Altura del origen sobre spoofFakePos (1.5 ≈ cabeza). Ajustá si el tracer sale muy alto/bajo." })
+        -- (Spoofed Shot Origin REMOVIDO: sospechoso del kick — forzar el origen de bala a spoofFakePos daba una
+        --  anomalía origen↔hit que el server valida. El origen/muzzle real del juego pasan sin tocar.)
 
         --== visualization (left, weight 3) ==--
         local viz = rb:AddPanel("visualization", { Column = 1, Weight = 3 })
@@ -4169,11 +4358,13 @@ return function(require, LIP, Lib)
         -- DISABLERS (experimental, opt-in, best-effort — pueden no hacer efecto / kickear igual. v51 sin re-decompilar).
         local rk4 = RK:AddPanel("AC Disablers", { Column = 2 })
         rk4:AddToggle("DisableMoveChecks", { Text = "disable move checks", Default = false,
-            Tooltip = "Hook GetPropertyChangedSignal en las partes del char p/ props de movimiento (CanCollide/Position/CFrame/velocity/WalkSpeed...) → señal MUERTA = el AC no puede vigilarlas vía changed-signal. Best-effort." })
+            Tooltip = "3 capas: (1) getconnections():Disable() sobre los watchers EXISTENTES del AC (WalkSpeed/JumpHeight/CanCollide) — mata la conexión real, no solo futuras; (2) hook __newindex que bloquea que el JUEGO re-active CanCollide en Head/Torso (noclip-safe); (3) DEAD_SIGNAL en GetPropertyChangedSignal futuras. ⚠ SOLO client-side: un check server-side (overlap) NO se apaga así. Reversible (:Enable al apagar)." })
         rk4:AddToggle("DisableACReports", { Text = "disable AC reports", Default = false,
             Tooltip = "Dropea los remotes cliente→server ACTrigger/ACCFrameChanged/ACKickTrigger/ACF → el server no recibe la detección. ⚠ opcodes v50 (verificar en v51)." })
         rk4:AddToggle("DisableUnequipHook", { Text = "disable UnequipToolsHook", Default = false,
             Tooltip = "Dropea solo el reporte ACTrigger('UnequipToolsHook') (detección de tool/hook)." })
+        rk4:AddToggle("BlockACKill", { Text = "block AC kill", Default = false,
+            Tooltip = "f72 hace un KILL LOCAL 0.5s tras CUALQUIER detección (Health=0 + BreakJoints + Neck:Destroy). Esto TRAGA esos writes/namecalls del JUEGO sobre tu char (los tuyos pasan por checkcaller) → sobrevivís el kill del AC. Compone con disableACReports (no report, no ban). ⚠ anti-muerte tipo godmode-lite (tapa Health≤0 de CUALQUIER fuente) + puede romper ragdoll legítimo. Client-side only." })
         rk3:AddSlider("PropAuraMaxMass", { Text = "Max Mass", Min = 20, Max = 2000, Default = 400,
             Tooltip = "Masa máxima de un prop reclamado. Bajo = solo cosas livianas (menos jitter, sin autos/estructural)." })
         rk3:AddToggle("PropAuraCrates", { Text = "Crates Only", Default = false,
@@ -4302,32 +4493,54 @@ return function(require, LIP, Lib)
     HitFX.init()     -- hitsounds / killsounds / hitmarker (op46)
     CrossHUD.init()  -- labels de estado del ragebot abajo del crosshair
 
-    -- ANTI-SLEEP (keep-alive del replicador): Roblox pausa la replicación de posición si el assembly
-    -- "duerme" (velocity < ~0.05 studs/s) → rompe el desync/spoof. La velocity vieja (0.003) estaba POR
-    -- DEBAJO del umbral → dormía igual. Ahora aplicamos una magnitud CLARAMENTE arriba del umbral (0.6
-    -- studs/s) ALTERNANDO el signo cada frame → nunca duerme, pero el desplazamiento neto ≈ 0 (no derivás).
-    local kaSign = 1
-    local sethidden = sethiddenproperty
+    -- KEEP-ALIVE (método canónico "bob", ref [[position-keepalive]]): el cliente solo replica la CFrame del
+    -- char cuando CAMBIA → idle sin delta = server-pos congelada. En vez de FORZAR NetworkIsSleeping=false
+    -- (replicación continua 60Hz = footprint anormal, sospechoso del "rps" del AC), generamos un MICRO-delta en
+    -- Y SOLO cuando estás idle → replica al rate NORMAL, footprint mínimo/legit. Centrado sin drift (aplicamos
+    -- newOff - lastOff). Solo Y (preserva yaw → shiftlock-safe, no rompe aim). NO corre bajo spoof/conn/grab/god
+    -- (esos ya escriben root.CFrame cada frame = replican solos). Sin velocity, sin sethiddenproperty.
+    local BOB_AMP = 0.01
+    local bobLast, bobPhase = 0, 1
     LIP.track(RunService.Heartbeat:Connect(function()
         local c = LP.Character
         local root = c and c:FindFirstChild("HumanoidRootPart")
-        if not root then return end
-        -- SIEMPRE forzar al replicador a NO dormir → tu posición se sigue mandando aunque estés 100% AFK,
-        -- INCLUSO con Pos Spoof/strafe activos (el server ve la pos falsa continua). Habilita atacar AFK
-        -- desde el panel web sin que la replicación se corte al quedarte quieto.
-        if sethidden then pcall(function() sethidden(root, "NetworkIsSleeping", false) end) end
-        -- IDLE real (NO controlado por spoof/strafe/void/grab/god): además de despertar el assembly, mover la
-        -- POSICIÓN un toque real (±0.08 studs alternante, no solo velocity) → el replicador ve delta y manda.
-        if not (LIP.spoofOn or LIP.connRep or LIP.awGrabbing or LIP.godBase) then
-            if root.AssemblyLinearVelocity.Magnitude < 2 then
-                kaSign = -kaSign
-                pcall(function()
-                    root.CFrame = root.CFrame + Vector3.new(0, 0.08 * kaSign, 0)
-                    root.AssemblyLinearVelocity = Vector3.new(0, 3 * kaSign, 0)
-                end)
-            end
+        local hum = c and c:FindFirstChildOfClass("Humanoid")
+        if not (root and hum) then return end
+        if LIP.spoofOn or LIP.connRep or LIP.awGrabbing or LIP.godBase then bobLast = 0; return end
+        if hum.MoveDirection.Magnitude >= 0.01 then
+            -- moviéndote: deshacer el offset residual del bob (evita drift acumulado), dejá replicar el movimiento real
+            if bobLast ~= 0 then pcall(function() root.CFrame = root.CFrame + Vector3.new(0, -bobLast, 0) end); bobLast = 0 end
+            return
         end
+        bobPhase = -bobPhase
+        local newOff = BOB_AMP * bobPhase
+        pcall(function() root.CFrame = root.CFrame + Vector3.new(0, newOff - bobLast, 0) end)
+        bobLast = newOff
     end))
+
+    -- CLEANUP workspace.__Ignore: el juego dibuja debug parts (rayos verde/rojo de la moto vía atributo
+    -- DebugDraw) ahí. Las barremos (throttle 0.5s) por su firma DD (Anchored + no CanCollide + no CanQuery +
+    -- SmoothPlastic) → limpia el ruido visual. Best-effort (el juego puede re-dibujar por frame; esto mata las
+    -- que quedan). Además: si algún modelo tiene el atributo DebugDraw en true, lo apagamos (corta la fuente).
+    do
+        local ignoreFolder
+        local nextClean = 0
+        LIP.track(RunService.Heartbeat:Connect(function()
+            local now = os.clock()
+            if now < nextClean then return end
+            nextClean = now + 0.5
+            if not (ignoreFolder and ignoreFolder.Parent) then ignoreFolder = Workspace:FindFirstChild("__Ignore") end
+            if not ignoreFolder then return end
+            for _, p in ipairs(ignoreFolder:GetChildren()) do
+                if p:IsA("BasePart") and p.Anchored and not p.CanCollide and not p.CanQuery
+                   and p.Material == Enum.Material.SmoothPlastic then
+                    pcall(function() p:Destroy() end)
+                elseif p:GetAttribute("DebugDraw") == true then
+                    pcall(function() p:SetAttribute("DebugDraw", false) end)
+                end
+            end
+        end))
+    end
 
     local T, O = Lib.Toggles, Lib.Options
 
@@ -4404,8 +4617,15 @@ return function(require, LIP, Lib)
         local manual = Strafe.manualPlayer()
         if manual then LIP.target = manual; return end
         if needAim then
-            Target.pick({ mode = O.SelMode.Value, fov = O.FOV.Value, wallcheck = T.Wallcheck.Value,
-                          teamCheck = filters.teamCheck, friendCheck = filters.friendCheck, ffCheck = filters.ffCheck })
+            -- SILENT MOUSE (toggle extra): override → closest-to-mouse (raycast bajo cursor + proyección),
+            -- SIN FOV y SIN wallcheck (offscreen/tras-pared OK, el silent aim swapea server-side).
+            if T.SilentMouse and T.SilentMouse.Value then
+                Target.pick({ mode = "MouseClosest", wallcheck = false,
+                              teamCheck = filters.teamCheck, friendCheck = filters.friendCheck, ffCheck = filters.ffCheck })
+            else
+                Target.pick({ mode = O.SelMode.Value, fov = O.FOV.Value, wallcheck = T.Wallcheck.Value,
+                              teamCheck = filters.teamCheck, friendCheck = filters.friendCheck, ffCheck = filters.ffCheck })
+            end
         else
             LIP.target = nil
         end
@@ -4417,12 +4637,11 @@ return function(require, LIP, Lib)
         LIP.meleeOn   = T.MeleeAura and T.MeleeAura.Value or false
         LIP.wallbang  = T.Wallbang and T.Wallbang.Value or false
         -- FORCE SPOOF ORIGIN (fix reveal): el hook fuerza origen/muzzle = spoofFakePos cuando spoofeado.
-        LIP.forceSpoofOrigin  = (T.ForceSpoofOrigin and T.ForceSpoofOrigin.Value) or false
-        LIP.spoofOriginHeight = (O.SpoofOriginHeight and O.SpoofOriginHeight.Value) or 1.5
         -- DISABLERS experimentales (opt-in): el hook los lee.
         LIP.disableMoveChecks  = (T.DisableMoveChecks and T.DisableMoveChecks.Value) or false
         LIP.disableACReports   = (T.DisableACReports and T.DisableACReports.Value) or false
         LIP.disableUnequipHook = (T.DisableUnequipHook and T.DisableUnequipHook.Value) or false
+        LIP.blockACKill        = (T.BlockACKill and T.BlockACKill.Value) or false
         -- bullet multiplier: N pellets por disparo (el Net hook padea el array del op14 del juego/nuestro)
         LIP.bulletMult = (T.MultiFire and T.MultiFire.Value and O.BulletMult and O.BulletMult.Value) or 1
         -- al CAMBIAR de arma: reset del firerate observado + contador → el autofire re-aprende el firerate nuevo
