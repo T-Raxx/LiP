@@ -1246,6 +1246,152 @@ return function(require, LIP, Lib)
         return (didDefensive and best.pos) or hitbox, didDefensive, score, #t.list, (best and best.count or 0)
     end
 
+    -- ══ RESOLVER JUJU CLUSTER (port fiel de jujulatest.txt cluster_resolve — reemplaza density/cluster/centroid
+    -- como método por defecto). Spatial-hash del log de posiciones REALES: para cada ancla cuenta vecinos dentro
+    -- de `forgiveness` (net adaptativo) vía grid 27-celdas → el blob MÁS DENSO = la pos real. forgiveness = base ×
+    -- radius_scale (respira 0.7-1.4); +voidBonus cerca del origen (void bait); −distPenalty·(dist/100) para far
+    -- (net chico → el void/3.7B NUNCA clusteriza = FIX del bug de predicción). sample_weight 0.45 post-void (una
+    -- fling frame no arrastra el centroide). Mean-shift al core denso + decoy handling (prefiere el blob que
+    -- continúa el patrón). **pattern-velocity CAPEADA a velCap(350) y accel a accelCap(400)** → el lead NUNCA
+    -- extrapola a billones aunque el target teleporte. pattern_trust sube/baja según caiga donde se espera.
+    Strafe.JUJU = { window = 2.75, forgiveness = 14.4, voidBonus = 5, distPenalty = 2, minSize = 4,
+                    velCap = 350, accelCap = 400 }
+    local cdata = {}   -- [plr] = { positions, radius_scale, pattern, pattern_time, pattern_velocity, pattern_accel,
+                       --           pattern_trust, last_real, last_real_time, last_void_time, last_scan, urgent_until }
+    Strafe.cdata = cdata
+    local function jujuResolve(plr, position, now, localPos, isVoid)
+        local J = Strafe.JUJU
+        local c = cdata[plr]
+        if not c then c = { positions = {}, radius_scale = 1, pattern_trust = 0.5, last_void_time = 0,
+                            last_scan = 0, urgent_until = 0 }; cdata[plr] = c end
+        -- FRAME VOID: NO metemos la pos far a la ventana (colapsaría forgiveness a 1 ese scan + la ensuciaría).
+        -- Solo marcamos last_void_time (→ las 1ras muestras post-void valen 0.45) y devolvemos el patrón cacheado
+        -- de los frames in-map reales. El void-spammer nunca contamina el cluster.
+        if isVoid then
+            c.last_void_time = now
+            return c.pattern, (c.pattern ~= nil), c.pattern_trust or 0, 0
+        end
+        local positions = c.positions
+        while #positions > 0 and (now - positions[1].time) > J.window do table.remove(positions, 1) end
+        c.radius_scale = 1 + ((c.radius_scale or 1) - 1) * 0.997
+        local forgiveness = J.forgiveness * (c.radius_scale or 1)
+        if (math.abs(position.X) + math.abs(position.Z)) < 8955 then forgiveness = forgiveness + J.voidBonus end
+        if localPos then
+            local distance = (position - localPos).Magnitude
+            forgiveness = math.clamp(forgiveness - (distance / 100) * J.distPenalty, 1, 100)
+        end
+        c.last_real = position; c.last_real_time = now
+        local sample_weight = (now - (c.last_void_time or 0) < 0.12) and 0.45 or 1
+        positions[#positions + 1] = { pos = position, time = now, w = sample_weight }
+        if #positions > 500 then table.remove(positions, 1) end
+        local total = #positions
+        if total < 10 then return nil, false, 0, 0 end
+        local scan_interval = (now < (c.urgent_until or 0)) and 0.045 or 0.09
+        if (now - (c.last_scan or 0)) < scan_interval then
+            return c.pattern, c.pattern ~= nil, c.pattern_trust or 0, 0
+        end
+        c.last_scan = now
+        local forg_sq = forgiveness * forgiveness
+        local required = J.minSize
+        if total < 60 then required = math.clamp(required - 1, 3, 10) end
+        local inv_cell = 1 / forgiveness
+        local grid = {}
+        for j = 1, total do
+            local p = positions[j].pos
+            local key = (math.floor(p.X * inv_cell) + 524288) * 1048576 + (math.floor(p.Y * inv_cell) + 524288) * 1024 + (math.floor(p.Z * inv_cell) + 524288)
+            local bk = grid[key]; if bk then bk[#bk + 1] = j else grid[key] = { j } end
+        end
+        local best_count, best_pos, runner_count, runner_pos = 0, nil, 0, nil
+        for i = 1, total do
+            local anchor = positions[i].pos
+            local cx, cy, cz = math.floor(anchor.X * inv_cell), math.floor(anchor.Y * inv_cell), math.floor(anchor.Z * inv_cell)
+            local count, sx, sy, sz, wt = 0, 0, 0, 0, 0
+            for ox = -1, 1 do local xb = (cx + ox + 524288) * 1048576
+                for oy = -1, 1 do local xyb = xb + (cy + oy + 524288) * 1024
+                    for oz = -1, 1 do
+                        local bk = grid[xyb + (cz + oz + 524288)]
+                        if bk then for b = 1, #bk do
+                            local o = positions[bk[b]]; local op = o.pos
+                            local dx, dy, dz = anchor.X - op.X, anchor.Y - op.Y, anchor.Z - op.Z
+                            local dsq = dx*dx + dy*dy + dz*dz
+                            if dsq <= forg_sq then
+                                local w = o.w * (1 - dsq / forg_sq * 0.65) / (1 + (now - o.time))
+                                count = count + 1; sx = sx + op.X * w; sy = sy + op.Y * w; sz = sz + op.Z * w; wt = wt + w
+                            end
+                        end end
+                    end
+                end
+            end
+            if count >= required and count > best_count and wt > 0 then
+                runner_count = best_count; runner_pos = best_pos
+                best_count = count; best_pos = Vector3.new(sx/wt, sy/wt, sz/wt)
+            elseif count >= required and count > runner_count and wt > 0 then
+                runner_count = count; runner_pos = Vector3.new(sx/wt, sy/wt, sz/wt)
+            end
+        end
+        if not best_pos then
+            c.radius_scale = math.clamp((c.radius_scale or 1) * 1.15, 0.7, 1.4)
+            c.pattern_trust = math.clamp((c.pattern_trust or 0.5) - 0.05, 0, 1)
+            return nil, false, 0, 0
+        end
+        if runner_pos and (best_count - runner_count) < required * 0.5 then
+            local bs, rs2
+            local pp, pt = c.pattern, c.pattern_time
+            if pp and pt and (now - pt) < 0.5 then
+                local pred = pp + (c.pattern_velocity or Vector3.zero) * (now - pt)
+                bs = (best_pos - pred).Magnitude; rs2 = (runner_pos - pred).Magnitude
+            elseif c.last_real then
+                bs = (best_pos - c.last_real).Magnitude; rs2 = (runner_pos - c.last_real).Magnitude
+            end
+            if bs and rs2 and rs2 < bs * 0.92 then best_pos = runner_pos; best_count = runner_count end
+        end
+        if best_count > required * 3 then c.radius_scale = math.clamp((c.radius_scale or 1) * 0.9, 0.7, 1.4)
+        elseif best_count < required * 2 then c.radius_scale = math.clamp((c.radius_scale or 1) * 1.08, 0.7, 1.4) end
+        local pp, pt = c.pattern, c.pattern_time
+        local gap = pt and (now - pt) or 0
+        if pp and gap > 0 and gap < 0.5 then
+            local pv = (best_pos - pp) / gap
+            if pv.Magnitude > J.velCap then pv = pv.Unit * J.velCap end
+            local prevV = c.pattern_velocity
+            if prevV then
+                local pa = (pv - prevV) / gap
+                if pa.Magnitude > J.accelCap then pa = pa.Unit * J.accelCap end
+                c.pattern_accel = pa
+            end
+            c.pattern_velocity = pv
+        end
+        local core_sq = forg_sq * 0.25
+        do
+            local count, sx, sy, sz, wt = 0, 0, 0, 0, 0
+            local ccx, ccy, ccz = math.floor(best_pos.X * inv_cell), math.floor(best_pos.Y * inv_cell), math.floor(best_pos.Z * inv_cell)
+            for ox = -1, 1 do local xb = (ccx + ox + 524288) * 1048576
+                for oy = -1, 1 do local xyb = xb + (ccy + oy + 524288) * 1024
+                    for oz = -1, 1 do
+                        local bk = grid[xyb + (ccz + oz + 524288)]
+                        if bk then for b = 1, #bk do
+                            local o = positions[bk[b]]; local op = o.pos
+                            local dx, dy, dz = best_pos.X - op.X, best_pos.Y - op.Y, best_pos.Z - op.Z
+                            local dsq = dx*dx + dy*dy + dz*dz
+                            if dsq <= core_sq then
+                                local w = o.w * (1 - dsq / core_sq * 0.65) / (1 + (now - o.time))
+                                count = count + 1; sx = sx + op.X * w; sy = sy + op.Y * w; sz = sz + op.Z * w; wt = wt + w
+                            end
+                        end end
+                    end
+                end
+            end
+            if count >= 3 and wt > 0 then best_pos = Vector3.new(sx/wt, sy/wt, sz/wt) end
+        end
+        local trust = c.pattern_trust or 0.5
+        if c.last_real and (now - (c.last_real_time or 0)) < 0.25 then
+            local expected = c.last_real + (c.pattern_velocity or Vector3.zero) * (now - (c.last_real_time or now))
+            if (best_pos - expected).Magnitude <= forgiveness * 0.85 then trust = math.clamp(trust + 0.18, 0, 1)
+            else trust = math.clamp(trust - 0.22, 0, 1) end
+        end
+        c.pattern_trust = trust; c.pattern = best_pos; c.pattern_time = now
+        return best_pos, (trust >= 0.5 and best_count >= required), trust, best_count
+    end
+
     -- ESTABILIDAD TEMPORAL del ganador: cuántos frames seguidos la pos resuelta no saltó (> stabThresh studs).
     -- Un ganador que salta = void-spammer bueno = nunca acumula = confianza baja. Método-agnóstico.
     local stab = {}   -- [player] = { lastPos, frames }
@@ -1273,8 +1419,8 @@ return function(require, LIP, Lib)
         local now = os.clock()
         local rs = resState[plr]
         if rs and rs.frameT == now then return rs.pos, rs.didDef end   -- cache por frame (varios callers/tick)
-        local method = O("ResolverMethod") or "Cluster"
-        if method == "Auto" then method = pickMethod(plr) end
+        local method = O("ResolverMethod") or "Juju"
+        if method == "Auto" then method = pickMethod(plr); if method == "Cluster" then method = "Juju" end end
         local pos, didDef, score, cl, state
         local winCount = 0
         local spread = nil
@@ -1289,11 +1435,17 @@ return function(require, LIP, Lib)
             pos, didDef = p or rawPos, dd or false
             score = sc or 0; cl = 0; winCount = 0; spread = sp
             state = dd and "LOCKED" or (p and "RESOLVING" or "VOID")
-        else
+        elseif method == "LegacyCluster" then
             local p, dd, sc, n, wc = resolveCluster(plr, rawPos, now, localPos)
             pos, didDef = p, dd
             score = sc or 0; cl = n or 0; winCount = wc or 0
             state = dd and "LOCKED" or ((cl > 0) and "RESOLVING" or "NORMAL")
+        else   -- "Juju" / "Cluster" (default): resolver juju cluster (spatial-hash + pattern-vel capeada)
+            local inVoid = (math.abs(rawPos.X) + math.abs(rawPos.Z)) >= Strafe.CONF.voidManhattan
+            local p, dd, sc, wc = jujuResolve(plr, rawPos, now, localPos, inVoid)
+            pos, didDef = p or rawPos, dd or false
+            score = sc or 0; cl = wc or 0; winCount = wc or 0
+            state = dd and "LOCKED" or (p and "RESOLVING" or "VOID")
         end
         local sf = updateStability(plr, pos)
         resState[plr] = { pos = pos, didDef = didDef, method = method, score = score, clusters = cl, state = state, frameT = now, stabFrames = sf, winCount = winCount, spread = spread }
@@ -1317,9 +1469,11 @@ return function(require, LIP, Lib)
         local now = os.clock()
         local r = myRoot(); local loc = r and r.Position or rawHitboxPos
         local pos, didDefensive = resolveByMethod(plr, rawHitboxPos, loc)
-        -- velocidad desde la pos RESUELTA (estable, sin los saltos del void) + sanity clamp (ningún player va
-        -- >200 studs/s) → el lead nunca se vuela a millones aunque el target spamee void.
-        local vel = Strafe.resolvedVel(plr, pos, now, O("ResolverRate") or 0.037)
+        -- LEAD: preferí la pattern_velocity del resolver JUJU (ya CAPEADA a velCap 350 sobre el TREND del patrón,
+        -- no sobre saltos crudos del void → NUNCA extrapola a billones aunque el target teleporte 3.7B studs).
+        -- Fallback a resolvedVel para métodos legacy. LeadCap queda como red de seguridad extra.
+        local cd = cdata[plr]
+        local vel = (cd and cd.pattern_velocity) or Strafe.resolvedVel(plr, pos, now, O("ResolverRate") or 0.037)
         -- CAP (no ZERO) de la magnitud del lead: un target REAL rápido (fly/vehículo a 300 studs/s) IGUAL
         -- leadea (dirección preservada, magnitud capeada). El void ya está guarded aparte (resolveByMethod da
         -- pos in-map), así que el lead nunca vuela a millones. Slider LeadCap (subir para fast movers).
@@ -4117,7 +4271,7 @@ return function(require, LIP, Lib)
 
         --========================= RAGE (juju.lol ragebot clone) =========================--
         local Rage = Window:AddCategory("rage", "crosshair")
-        local RParams = Strafe.RParams; local DEN = Strafe.DEN; local CONF = Strafe.CONF; local CEN = Strafe.CEN
+        local RParams = Strafe.RParams; local DEN = Strafe.DEN; local CONF = Strafe.CONF; local CEN = Strafe.CEN; local JUJU = Strafe.JUJU
 
         -- ===== ragebot sub-tab =====
         local rb = Rage:AddSection("ragebot", "", { Columns = 2 })
@@ -4162,7 +4316,8 @@ return function(require, LIP, Lib)
         local sr = gen:AddToggle("Resolver", { Text = "spam resolver", Default = false,
             Tooltip = "Resuelve el centro REAL del target (el strafe orbita ahí, no su jitter)" })
         local src = sr:AddConfig()
-        src:AddDropdown("ResolverMethod", { Text = "method", Values = { "Cluster", "Density", "Centroid", "Auto" }, Default = "Cluster" })
+        src:AddDropdown("ResolverMethod", { Text = "method", Values = { "Juju", "Density", "Centroid", "Auto", "LegacyCluster" }, Default = "Juju",
+            Tooltip = "Juju = cluster spatial-hash con pattern-velocity CAPEADA (fix del void-spam a 3.7B studs). Density/Centroid = métodos legacy. LegacyCluster = el cluster viejo." })
         src:AddLabel("full tuning in the resolver tab", {})
 
         local pred = gen:AddLabel("prediction")
@@ -4366,6 +4521,22 @@ return function(require, LIP, Lib)
         rcen:AddToggle("WeaponClamp", { Text = "weapon clamp", Default = true,
             Tooltip = "Con follow target: clampa mi pos a rango de arma del centro resuelto." })
         rcen:AddSlider("WeaponRange", { Text = "weapon range", Min = 30, Max = 300, Default = 125, Suffix = "st" })
+
+        local rjuju = res:AddPanel("juju cluster", { Column = 2 })
+        rjuju:AddSlider("JujuForgiveness", { Text = "cluster radius", Min = 2, Max = 60, Default = 14.4, Decimals = 1, Suffix = "st",
+            Callback = function(v) if JUJU then JUJU.forgiveness = v end end })
+        rjuju:AddSlider("JujuVoidBonus", { Text = "out of void bonus", Min = 0, Max = 30, Default = 5, Decimals = 1, Suffix = "st",
+            Callback = function(v) if JUJU then JUJU.voidBonus = v end end })
+        rjuju:AddSlider("JujuDistPenalty", { Text = "distance penalty", Min = 0, Max = 8, Default = 2, Decimals = 2, Suffix = "x",
+            Tooltip = "Achica el net por distancia → el void/far NUNCA clusteriza (fix del 3.7B).",
+            Callback = function(v) if JUJU then JUJU.distPenalty = v end end })
+        rjuju:AddSlider("JujuMinSize", { Text = "min cluster size", Min = 3, Max = 10, Default = 4,
+            Callback = function(v) if JUJU then JUJU.minSize = math.floor(v) end end })
+        rjuju:AddSlider("JujuWindow", { Text = "window", Min = 0.5, Max = 5, Default = 2.75, Decimals = 2, Suffix = "s",
+            Callback = function(v) if JUJU then JUJU.window = v end end })
+        rjuju:AddSlider("JujuVelCap", { Text = "lead vel cap", Min = 50, Max = 800, Default = 350, Suffix = "st/s",
+            Tooltip = "Cap de la pattern-velocity → el lead nunca extrapola a billones.",
+            Callback = function(v) if JUJU then JUJU.velCap = v end end })
 
         local rdyn = res:AddPanel("dynamic", { Column = 2 })
         rdyn:AddToggle("DynStrafe", { Text = "dynamic cycle", Default = false,
@@ -4595,6 +4766,16 @@ return function(require, LIP, Lib)
     -- Y SOLO cuando estás idle → replica al rate NORMAL, footprint mínimo/legit. Centrado sin drift (aplicamos
     -- newOff - lastOff). Solo Y (preserva yaw → shiftlock-safe, no rompe aim). NO corre bajo spoof/conn/grab/god
     -- (esos ya escriben root.CFrame cada frame = replican solos). Sin velocity, sin sethiddenproperty.
+    -- BOB SOLO CON FEATURES ACTIVAS: si NINGUNA feature de posición/combate está prendida = AFK real → NO bob →
+    -- el char DUERME (sin replicación) → footprint cero → el AC score DECAE mientras estás quieto. (pedido usuario.)
+    local KEEPALIVE_FLAGS = { "TargetStrafe", "AutoFire", "SilentAim", "Fly", "Noclip", "PosSpoof", "ConnExploit",
+        "Godmode", "MeleeAura", "AutoPunch", "VoidSpam", "CFrameDesync", "VelDesync", "WalkSpeedOn", "JumpOn", "InfJump" }
+    local function keepAliveWanted()
+        for _, f in ipairs(KEEPALIVE_FLAGS) do
+            local t = Lib.Toggles[f]; if t and t.Value then return true end
+        end
+        return false
+    end
     local BOB_AMP = 0.01
     local bobLast, bobPhase = 0, 1
     LIP.track(RunService.Heartbeat:Connect(function()
@@ -4602,6 +4783,7 @@ return function(require, LIP, Lib)
         local root = c and c:FindFirstChild("HumanoidRootPart")
         local hum = c and c:FindFirstChildOfClass("Humanoid")
         if not (root and hum) then return end
+        if not keepAliveWanted() then bobLast = 0; return end   -- AFK real (0 features) → dejar dormir, score decae
         if LIP.spoofOn or LIP.connRep or LIP.awGrabbing or LIP.godBase then bobLast = 0; return end
         if hum.MoveDirection.Magnitude >= 0.01 then
             -- moviéndote: deshacer el offset residual del bob (evita drift acumulado), dejá replicar el movimiento real
